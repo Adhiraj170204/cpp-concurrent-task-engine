@@ -1,0 +1,53 @@
+# Build trees. D11 defines four: debug, asan, tsan, release.
+# Kept outside source directories; never committed.
+build/
+build-*/
+cmake-build-*/
+
+# CMake-generated files, in case a tree is ever configured in-source by mistake.
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+CMakeUserPresets.json
+_deps/
+
+# Compile database: generated, machine-specific, but useful to editors.
+compile_commands.json
+
+# Object files, libraries, executables.
+*.o
+*.a
+*.so
+*.so.*
+*.out
+
+# Precompiled headers and generated dependency files.
+*.gch
+*.pch
+*.d
+
+# Crash and debug artifacts. Expected while testing shutdown paths and UB.
+core
+core.*
+vgcore.*
+
+# Sanitizer, coverage, and profiler output (D11).
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.gcov
+perf.data
+perf.data.old
+callgrind.out.*
+
+# Editor and tooling state.
+.vscode/
+.idea/
+.cache/
+.clangd/
+*.swp
+*~
