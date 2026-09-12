@@ -30,6 +30,8 @@ FetchContent_MakeAvailable(googletest)
 # code they test (ARCHITECTURE.md 0.1).
 # ---------------------------------------------------------------------------
 add_executable(taskengine_unit_tests
+    unit/task_result_test.cpp
+    unit/task_test.cpp
     unit/version_test.cpp)
 
 # taskengine carries cxx_std_17 as a PUBLIC compile feature, so the test target

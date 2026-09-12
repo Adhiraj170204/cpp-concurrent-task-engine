@@ -474,3 +474,118 @@ header — fewer moving parts, no translation unit, but unverifiable.
 boundary. Irrelevant: it is called once, at startup. The version string itself
 comes from `project(VERSION ...)` via a compile definition with no fallback, so
 a misconfigured build fails to compile rather than reporting a wrong version.
+
+---
+
+## D19 — Core result model makes invalid states unrepresentable
+
+**Status:** Accepted · **Milestone:** M2
+
+**Decision.** `TaskResult` has no public constructor and no default
+constructor. It is built only through three named factories — `succeeded`,
+`failed` and `rejected` — and `rejected` takes two time points rather than a
+whole `TaskTimings`.
+
+**Reason.** The engine can only ever produce three shapes of result, and a
+plain aggregate would also permit combinations it never produces: a `Succeeded`
+result carrying an error message, or a default-constructed result describing a
+task that never existed. Pushing that into the type means the invariant is
+enforced once, at construction, instead of being re-checked by every consumer.
+The asymmetric `rejected` signature exists for the same reason: a rejected task
+never reached a worker, so it has no dequeue instant, and the type should not
+let a caller describe an execution window that never happened. `rejected` sets
+`dequeued` equal to `finished`, so `execution_time()` is zero rather than a
+meaningless value measured from a default-constructed time point.
+
+**Alternative considered.** A plain aggregate `struct TaskResult` — shorter, and
+brace-initialisable at the call site, but it admits states the engine cannot
+produce and gives every reader of a result a reason to wonder whether the error
+field is meaningful. A `std::variant` of three result types — precise, but it
+forces `std::visit` on every consumer for no gain, since all three share the
+same fields.
+
+**Trade-off.** Three factory names to learn, and one more line per construction
+site than aggregate initialisation. `TaskResult` is not default-constructible,
+which would matter if it ever had to live in a container that default-fills;
+`std::promise<TaskResult>` does not require it.
+
+**Related.** `TaskId` is a plain `std::uint64_t` alias, not a strong type. It is
+an opaque counter used only for identity and diagnostics, and no other integer
+appears in these interfaces that could be confused with it; a strong type would
+have to carry its own comparison, hashing and streaming support to pay for
+itself. Revisit if an interface ever takes both an id and a count.
+
+---
+
+## D20 — `Task` suppresses public copy and move, and anchors its own vtable
+
+**Status:** Accepted · **Milestone:** M2
+
+**Decision.** `Task` declares all five special members. The destructor is
+virtual, declared in the header and **defined out of line** in
+`src/core/task.cpp`. The copy and move constructors and assignment operators are
+`protected` and defaulted.
+
+**Reason.** Two separate concerns, both standard practice for a polymorphic
+base.
+
+*Protected copy and move.* Being abstract already prevents constructing a `Task`
+by value, so the usual slicing-on-copy story does not apply. The real exposure
+is **assignment through a reference**: with a public `operator=`, code holding
+two `Task&` could assign one over the other and partially overwrite the derived
+object. Making the operators protected makes that a compile error while leaving
+derived types free to copy and move themselves, which is exactly the desired
+split. This is asserted in the tests rather than left as a comment:
+`!std::is_copy_assignable_v<Task>` and `!std::is_move_assignable_v<Task>`.
+
+*Out-of-line destructor.* A vtable and `type_info` are emitted alongside a
+class's first non-inline, non-pure virtual member — the "key function". With
+every virtual member inline, the compiler emits a copy of the vtable in every
+translation unit that includes the header and relies on the linker to merge
+them. Defining `~Task()` in one source file pins them to one object file.
+
+**Alternative considered.** `= default` in the header for the destructor —
+simpler to read, but emits the vtable everywhere. Deleting copy and move
+outright — also prevents derived types from copying themselves, which is a
+bigger restriction than the problem warrants. Saying nothing and relying on the
+implicit declarations — leaves a public copy assignment on a polymorphic base,
+which is the defect being avoided.
+
+**Trade-off.** Five extra lines in the header and one source file that contains
+a single defaulted function. In exchange the class states its copy semantics
+explicitly instead of inheriting them by accident, which is the point.
+
+---
+
+## D21 — `Sample` deferred from M2 to M5
+
+**Status:** Accepted · **Milestone:** M2 (deferring to M5)
+
+**Decision.** `Sample` is not implemented at M2, despite ARCHITECTURE.md §1.2
+listing it among the types `core/` owns at that milestone. It arrives with the
+metrics collection that consumes it.
+
+**Reason.** A genuine tension between two parts of the approved architecture.
+§1.2 assigns `Sample` to `core/` at M2; §0.1 rule 2 forbids creating a type
+"merely because it appears in this document" and requires it to arrive in the
+milestone that needs it. §0.1 is a *standing constraint* that explicitly governs
+every task in every milestone, so it wins. `Sample` has no consumer until the
+thread pool records timings at M5: written now, it would be an untested
+structure with no caller — exactly the unexplainable code §0.1 exists to
+prevent.
+
+The M2 deliverable in PLAN.md is "task abstraction, result/error model,
+lifecycle tests", and `Sample` is a metrics concern rather than part of the
+result model. `TaskTimings` — the part the result model genuinely needs — **is**
+implemented at M2 and tested.
+
+**Alternative considered.** Implement `Sample` now to match the §1.2 milestone
+column literally. Rejected: it would satisfy a table at the cost of the
+principle the table sits beneath.
+
+**Trade-off.** §1.2's milestone column is now slightly ahead of reality for one
+type. The column is guidance about where a type belongs, not a schedule with
+force of its own; no code depends on it.
+
+**Action at M5.** `Sample` lands with the metrics buffers, as the compact
+trivially-copyable twin of `TaskResult` described in §4.3.

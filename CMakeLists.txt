@@ -58,6 +58,7 @@ set(TASKENGINE_WARNINGS
 # deployment story, and no rpath or ABI concerns in the M12 container.
 # ---------------------------------------------------------------------------
 add_library(taskengine STATIC
+    src/core/task.cpp
     src/version.cpp)
 
 target_include_directories(taskengine PUBLIC
