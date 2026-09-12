@@ -10,6 +10,8 @@ project(TaskEngine
         DESCRIPTION "Concurrent task processing engine"
         LANGUAGES CXX)
 
+find_package(Threads REQUIRED)
+
 # C++17 with no compiler extensions: the compiler is invoked as -std=c++17
 # rather than -std=gnu++17, so non-standard constructs fail to compile instead
 # of being silently accepted. Verified by checking that __STRICT_ANSI__ is
@@ -53,6 +55,39 @@ set(TASKENGINE_WARNINGS
     -Werror)
 
 # ---------------------------------------------------------------------------
+# Sanitizers (ARCHITECTURE.md 9.1). ASan and TSan are mutually exclusive
+# runtimes that cannot share a binary, so this is one choice rather than a set
+# of toggles, and each selection wants its own build directory.
+#
+# Applied at directory scope, which reaches GoogleTest as well. That is
+# deliberate, and is the one place the "our targets only" rule of
+# ARCHITECTURE.md 9.2 does not apply: a sanitizer only reasons about
+# instrumented code, so mixing instrumented and uninstrumented objects produces
+# both missed races and false reports. Section 9.3 builds GoogleTest from source
+# precisely so that it can be instrumented. The warning policy stays
+# target-scoped, because that rule is about -Werror and not about sanitizers.
+# See D22.
+# ---------------------------------------------------------------------------
+set(TASKENGINE_SANITIZER "off" CACHE STRING
+    "Sanitizer build: off | address+undefined | thread")
+set_property(CACHE TASKENGINE_SANITIZER PROPERTY STRINGS
+             off address+undefined thread)
+
+if(TASKENGINE_SANITIZER STREQUAL "address+undefined")
+  # -fno-sanitize-recover makes UBSan abort instead of printing and carrying on,
+  # so a violation fails the run rather than scrolling past in a log.
+  add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all
+                      -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=address,undefined)
+elseif(TASKENGINE_SANITIZER STREQUAL "thread")
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=thread)
+elseif(NOT TASKENGINE_SANITIZER STREQUAL "off")
+  message(FATAL_ERROR
+          "TASKENGINE_SANITIZER must be off, address+undefined, or thread")
+endif()
+
+# ---------------------------------------------------------------------------
 # Library: taskengine
 # One library target for the whole core (D7). Static: simplest ownership and
 # deployment story, and no rpath or ABI concerns in the M12 container.
@@ -69,6 +104,11 @@ target_include_directories(taskengine PUBLIC
 target_compile_features(taskengine PUBLIC cxx_std_17)
 
 target_compile_options(taskengine PRIVATE ${TASKENGINE_WARNINGS})
+
+# BlockingQueue uses std::mutex and std::condition_variable, so the threading
+# library is part of what this library requires of its consumers, not an
+# implementation detail. PUBLIC, so anything linking taskengine gets it.
+target_link_libraries(taskengine PUBLIC Threads::Threads)
 
 # Single source of truth for the version string: it lives in project() above
 # and reaches the code from there. No fallback definition, so a build without

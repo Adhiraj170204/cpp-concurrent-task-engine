@@ -30,6 +30,7 @@ FetchContent_MakeAvailable(googletest)
 # code they test (ARCHITECTURE.md 0.1).
 # ---------------------------------------------------------------------------
 add_executable(taskengine_unit_tests
+    unit/blocking_queue_test.cpp
     unit/task_result_test.cpp
     unit/task_test.cpp
     unit/version_test.cpp)
@@ -50,3 +51,20 @@ target_compile_options(taskengine_unit_tests PRIVATE ${TASKENGINE_WARNINGS})
 include(GoogleTest)
 gtest_discover_tests(taskengine_unit_tests
     PROPERTIES LABELS unit)
+
+# ---------------------------------------------------------------------------
+# Concurrency tests -- CTest label "concurrency" (ARCHITECTURE.md 10.1)
+# A separate binary so the fast unit suite can be run on its own during
+# development, and so the threaded suite can be pointed at a TSan build.
+# ---------------------------------------------------------------------------
+add_executable(taskengine_concurrency_tests
+    concurrency/blocking_queue_concurrency_test.cpp)
+
+target_link_libraries(taskengine_concurrency_tests PRIVATE
+    taskengine
+    GTest::gtest_main)
+
+target_compile_options(taskengine_concurrency_tests PRIVATE ${TASKENGINE_WARNINGS})
+
+gtest_discover_tests(taskengine_concurrency_tests
+    PROPERTIES LABELS concurrency)

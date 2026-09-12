@@ -4,12 +4,12 @@ A concurrent task-processing engine in C++17. The project is a study of
 ownership, lifetime and concurrency correctness rather than a feature exercise:
 every abstraction in it has to justify its own existence.
 
-> **Status: Milestone 2 — task model.**
+> **Status: Milestone 3 — blocking queue.**
 > The engine is not running tasks yet. What exists today is the CMake/C++17
-> foundation plus the core task model: the `Task` interface and the result,
-> error and timing types, with their ownership and lifetime behaviour under
-> test. The blocking queue, thread pool, metrics, CLI and benchmarks arrive
-> in later milestones. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+> foundation, the core task model, and a bounded thread-safe producer/
+> consumer queue with its concurrency suite. The thread pool, metrics, CLI
+> and benchmarks arrive in later milestones.
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 > describes the design they will follow.
 
 ## Requirements
@@ -65,7 +65,8 @@ case rather than the binary. Suites carry labels, so a subset can be run
 directly:
 
 ```bash
-ctest --test-dir build/debug -L unit
+ctest --test-dir build/debug -L unit          # fast, no threads
+ctest --test-dir build/debug -L concurrency  # threaded behaviour
 ```
 
 GoogleTest is fetched from GitHub at *configure* time, so the first configure
@@ -73,6 +74,41 @@ needs network access. To build without it:
 
 ```bash
 cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug -DTASKENGINE_BUILD_TESTS=OFF
+```
+
+## Sanitizers
+
+`TASKENGINE_SANITIZER` selects one of `off` (default), `address+undefined`, or
+`thread`. AddressSanitizer and ThreadSanitizer are mutually exclusive runtimes
+and cannot share a binary, so each gets its own build directory.
+
+```bash
+# AddressSanitizer + UndefinedBehaviorSanitizer
+cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug -DTASKENGINE_SANITIZER=address+undefined
+cmake --build build/asan -j"$(nproc)"
+ctest --test-dir build/asan --output-on-failure
+
+# ThreadSanitizer
+cmake -S . -B build/tsan -DCMAKE_BUILD_TYPE=Debug -DTASKENGINE_SANITIZER=thread
+setarch "$(uname -m)" -R cmake --build build/tsan -j"$(nproc)"
+TSAN_OPTIONS=halt_on_error=1 setarch "$(uname -m)" -R     ctest --test-dir build/tsan --output-on-failure
+```
+
+`setarch -R` is needed for ThreadSanitizer on current kernels, including WSL2.
+TSan maps its shadow memory at fixed addresses and aborts with
+`FATAL: ThreadSanitizer: unexpected memory mapping` when ASLR entropy is set to
+the modern default of `vm.mmap_rnd_bits = 32`. Lowering that sysctl is the usual
+fix and needs root; `setarch -R` disables randomisation for one process tree and
+does not. It wraps the **build** as well as the test run, because
+`gtest_discover_tests` runs the test binary at build time to enumerate cases.
+
+Never benchmark a sanitizer build. ASan costs roughly 2x and TSan 5-15x, so a
+sanitized timing is not a timing.
+
+To shake out interleavings rather than sampling one:
+
+```bash
+ctest --test-dir build/tsan -L concurrency --repeat until-fail:25
 ```
 
 ## Run
@@ -90,6 +126,7 @@ CMakeLists.txt              project, C++17, warning policy, targets
 include/taskengine/         public headers
 src/                        library sources and the executable entry point
 tests/unit/                 unit suite (CTest label: unit)
+tests/concurrency/          threaded suite (CTest label: concurrency)
 docs/                       architecture and decision records
 build/                      build trees (gitignored)
 ```

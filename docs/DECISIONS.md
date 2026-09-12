@@ -589,3 +589,105 @@ force of its own; no code depends on it.
 
 **Action at M5.** `Sample` lands with the metrics buffers, as the compact
 trivially-copyable twin of `TaskResult` described in §4.3.
+
+---
+
+## D22 — Sanitizer wiring lands at M3, and sanitizer flags are global where warning flags are not
+
+**Status:** Accepted · **Milestone:** M3 (ARCHITECTURE.md §9.2 nominally M7)
+
+**Decision.** The `TASKENGINE_SANITIZER` cache option (`off` |
+`address+undefined` | `thread`) is added at M3 rather than M7. Its flags are
+applied with `add_compile_options` / `add_link_options` at directory scope, so
+they reach GoogleTest as well. The warning policy remains target-scoped and
+`PRIVATE`.
+
+**Reason — two separate points.**
+
+*Why at M3.* ARCHITECTURE.md §9.4 states that TSan is "the real verification
+mechanism for Milestones 3 and 4". M3 cannot honestly be called complete without
+it, and a concurrency test suite that has never been under TSan proves very
+little. The alternative — passing sanitizer flags ad hoc on the command line —
+works but is not reproducible: a reviewer would have to already know the flag
+set, which defeats the purpose of writing it down.
+
+*Why global.* §9.2 says sanitizer flags should be applied "on our own targets
+only — never through global `CMAKE_CXX_FLAGS`". Taken literally that is wrong
+for sanitizers, and it contradicts §9.3 in the same document, which builds
+GoogleTest from source *precisely so that it can be instrumented*. A sanitizer
+only reasons about instrumented code: mixing instrumented and uninstrumented
+objects causes TSan both to miss real races behind uninstrumented frames and to
+report false ones, because it cannot see the happens-before edges established
+inside the uninstrumented code. §9.2's rule is really about `-Werror`, where the
+concern is an upstream change breaking our build. That concern does not transfer
+to `-fsanitize`.
+
+Verified rather than assumed: `-fsanitize=thread` is present in both our own
+targets' flags and GoogleTest's.
+
+**Alternative considered.** Target-scoped sanitizer flags matching §9.2
+literally — leaves GoogleTest uninstrumented and makes TSan results
+untrustworthy. Deferring all sanitizer work to M7 — leaves M3 and M4, the two
+riskiest milestones, validated only by tests that prove one interleaving worked.
+
+**Trade-off.** §9.2 is now more precise than it was: warning policy
+target-scoped, sanitizer policy directory-scoped. Sanitizer builds need their own
+build directory, which §9.1 already required since ASan and TSan cannot share a
+binary. M7 is correspondingly smaller: it becomes stress coverage and documented
+routine runs rather than build plumbing.
+
+**Environment note.** On this kernel (WSL2, 6.6) TSan aborts at startup with
+`FATAL: ThreadSanitizer: unexpected memory mapping`. This is the well-known
+conflict between TSan's fixed shadow-memory layout and the ASLR entropy modern
+kernels use (`vm.mmap_rnd_bits = 32`). The usual fix lowers that sysctl and
+needs root. `setarch "$(uname -m)" -R` disables randomisation for one process
+tree instead, needs no privileges, and is what the README documents. It is
+required for the *build* as well as the test run, because
+`gtest_discover_tests` executes the test binary at build time to enumerate
+cases.
+
+---
+
+## D23 — BlockingQueue interface: rvalue push, optional pop, draining close
+
+**Status:** Accepted · **Milestone:** M3
+
+**Decision.** Three interface choices, all of which encode a guarantee in the
+signature rather than in documentation.
+
+- `bool push(T&& value)` — an rvalue reference, not a by-value sink parameter.
+- `std::optional<T> pop()` — no separate "is the queue finished" query.
+- `close()` stops intake but delivers everything already queued.
+
+**Reason.**
+
+*`T&&`.* A by-value parameter would silently accept an lvalue and copy it. An
+rvalue reference makes the caller write `std::move`, so a copy cannot happen by
+accident and the no-copy property is enforced by the compiler rather than by a
+comment. The queue will carry move-only envelopes, where this matters.
+
+*`std::optional<T>`.* The alternative shapes all have a race built in. A
+`bool pop(T& out)` needs `T` to be default-constructible, which the envelope is
+not. A separate `is_closed()` check before `pop()` is a check-then-act: the
+queue can close between the two calls. Returning `optional` makes "took an item"
+and "the queue is finished" a single atomic answer. `pop()` emplaces into the
+optional rather than assigning, so `T` need not be default-constructible at all.
+
+*Draining close.* If `close()` discarded queued items, a consumer could not
+distinguish "finished" from "gave up", and the drain-shutdown mode the thread
+pool needs would have to be built somewhere else. Because `pop()` returns
+`nullopt` only when the queue is both closed **and** empty, a consumer that
+loops until `nullopt` has provably seen every item whose `push` returned true.
+The abort-shutdown mode that *does* discard queued work is a thread-pool
+concern and arrives with it at M4.
+
+**Alternative considered.** `bool try_push` / `bool try_pop` non-blocking
+variants — nothing needs them yet, and adding them now would be speculative.
+An `emplace`-style variadic push — saves one move, at the cost of a forwarding
+interface that is harder to read; the move is not on any measured hot path.
+
+**Trade-off.** Callers must write `std::move` at every push site, which is
+slightly noisier and is the point. `size()` is exposed but is a momentary
+snapshot, useless for control flow and documented as such; it exists for
+invariant checks such as "never above capacity" and for queue-depth reporting
+during benchmarking.
