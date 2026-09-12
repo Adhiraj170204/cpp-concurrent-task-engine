@@ -870,9 +870,14 @@ treating as settled.
 
 ---
 
-## D28 — Checkpoint C2 resolved: the `Task` hierarchy is kept, with the justification still owed
+## D28 — Checkpoint C2 resolved: the `Task` hierarchy is kept
 
-**Status:** Accepted, **with a caveat** · **Milestone:** M5 · **Resolves:** checkpoint C2 (ARCHITECTURE.md §0.3)
+**Status:** Accepted · **Milestone:** M5 · **Resolves:** checkpoint C2 (ARCHITECTURE.md §0.3)
+
+> **Update (D30).** The caveat below — that the runtime-dispatch justification
+> was still owed at M11 — is settled. That milestone no longer exists, so C2 was
+> re-decided on the remaining evidence rather than deferred again, and is now
+> closed. The verdict is unchanged: the hierarchy is kept. See D30.
 
 **The question C2 asked.** If the concrete task types differ only by a parameter
 **and** nothing dispatches on type at runtime, collapse the hierarchy to
@@ -953,5 +958,139 @@ off the hot path by construction: it runs once, after the workers have stopped.
 **Related.** `Sample` lands here rather than at M2, as D21 scheduled, now that
 there is a consumer for it. Concrete task types live in a new `tasks/` module:
 they are neither vocabulary (`core/`) nor mechanism (`concurrency/`) nor policy
-(`execution/`), they are workloads, and the CLI, the benchmark driver and the
-eventual broker factory all reach for them independently.
+(`execution/`), they are workloads, and the CLI and the benchmark driver reach
+for them independently.
+
+---
+
+## D30 — Scope reduced to the C++ engine; service integrations removed from the roadmap
+
+**Status:** Accepted · **Milestone:** M5/M6 boundary · **Supersedes forward references in:** D1, D3, D5, D9, D27, D28
+
+**Decision.** The roadmap ends at Milestone 8. The final scope is: task
+execution behaviour (M5, complete), CLI (M6), testing and sanitizer hardening
+(M7), benchmarking (M8).
+
+Removed from the roadmap entirely: FastAPI service, RabbitMQ adapter, MongoDB,
+AWS, Kubernetes, Terraform, distributed scheduling, per-task cancellation, and
+further external integrations. Folded into the remaining milestones rather than
+dropped: Linux operational observation and failure-mode hardening into M7,
+repository and documentation polish into M8.
+
+**Reason.** Those integrations are already demonstrated elsewhere in the
+portfolio, so building them again here would add breadth that is already
+covered while diluting the one thing this repository is for: C++17 ownership,
+lifetime and concurrency correctness that the author can defend line by line.
+
+The interview-defensibility argument runs the same way. A repository containing
+a broker adapter and an HTTP service invites questions about all of them, and
+every additional surface is another thing to have to explain under pressure. A
+smaller repository where every file has a reason to exist is a stronger artefact
+than a larger one where some of it is scaffolding. The project already applies
+that test file by file; this applies it to the roadmap.
+
+There is also a truthfulness point. A half-finished RabbitMQ adapter on a
+resume-facing project is worse than none: it claims familiarity the code would
+not survive being asked about.
+
+**Alternative considered.** Keep the integrations as optional stretch
+milestones after M8. Rejected because "optional later" is how scaffolding gets
+written and never finished, and because an unfinished integration sitting in the
+tree is exactly the unexplainable code the project set out to avoid. Removing
+them from the roadmap is a decision; leaving them as maybe is not.
+
+**Trade-off.** The end-to-end flow this project originally described is not
+built. The engine was always specified to work standalone, so nothing already
+written depends on it, and the boundary that would have carried it is still
+clean: nothing below `app/` knows about HTTP, brokers or containers, and the
+dependency graph is unchanged.
+
+### Forward references this invalidates
+
+Several earlier decisions justified themselves partly by pointing at milestones
+that no longer exist. Those entries are left as written, because a decision log
+records what was believed at the time; this section records what is no longer
+true.
+
+- **D28 and checkpoint C2 (`Task` polymorphism).** The outstanding
+  justification was a factory at M11 selecting a concrete task type from a
+  broker payload. That milestone is gone, so **the justification will never
+  arrive** and C2 cannot be deferred again. Re-deciding it now on the evidence
+  that remains: the two concrete types differ in kind rather than by a
+  parameter, which is the condition C2 required, and that condition stands on
+  its own. `ComputeTask` saturates a core while `SleepTask` occupies a worker
+  without one; they respond to worker count in opposite directions, and the M8
+  benchmark needs both. **Verdict: the hierarchy is kept, and C2 is closed
+  rather than reopened.** The cost — one allocation and one virtual call per
+  task — gets a measured number at M8 instead of an assertion.
+- **D1** cited the same M11 factory. Superseded by the above.
+- **D3** cited a FastAPI status endpoint as a secondary benefit of returning
+  `std::future`. The primary reasons are unaffected: it is standard library, it
+  needs no dependency, and it gives one place to enforce the exactly-once
+  fulfilment invariant.
+- **D5** described backpressure as the honest behaviour for something later fed
+  by a broker. The argument does not depend on the broker: an unbounded queue
+  still converts a rate mismatch into unbounded memory growth, and bounding it
+  is still what makes a queue-wait measurement mean anything.
+- **D9** deferred the question of a logging framework to a RabbitMQ consumer
+  that will not be built. A minimal stderr diagnostic is now the final answer,
+  not a provisional one.
+- **D27** cited future HTTP and broker layers as a reason to keep `TaskEngine`
+  separate from `ThreadPool`. That reason is gone; the others are not. The two
+  suites still exercise the two levels independently, and the CLI at M6 is the
+  remaining consumer of the separation. C1 is worth one honest look at the end
+  of M6, as D27 already said.
+- **JSON dependency**, listed in ARCHITECTURE.md §12 for M11 only, is removed.
+  The project ends with exactly one dependency, GoogleTest, in test builds only.
+
+### Not covered by this decision
+
+Container packaging was not named in the scope reduction. It was raised as the
+one item worth confirming, and has since been approved as a single multi-stage
+Dockerfile at M8 with no orchestration. See D31.
+
+---
+
+## D31 — One multi-stage Dockerfile at M8, and nothing else container-shaped
+
+**Status:** Accepted · **Milestone:** M8
+
+**Decision.** A single multi-stage `Dockerfile` at the repository root, building
+and running the `task-engine` CLI. Pinned base image, build tooling confined to
+the build stage, non-root runtime user, and a runtime stage containing the
+binary and its runtime libraries and nothing else.
+
+Explicitly not included: Docker Compose, an entrypoint script wrapping a
+service, a registry or publishing step, and any of the integrations D30 removed.
+Compose exists to orchestrate several services; there is exactly one process
+here, so it would be ceremony describing a topology that does not exist.
+
+**Reason.** This is the one piece of the deferred deployment work that is about
+**build reproducibility** rather than about adding a service surface. It answers
+a question the README currently cannot: how does someone who is not on WSL2
+Ubuntu 24.04 with GCC 13 build and run this. Right now the answer is a list of
+prerequisites and some hope; a pinned image makes it exact.
+
+It also stays inside the project's own rule that every file has to earn its
+place. A Dockerfile that builds the thing the repository is about is
+explainable layer by layer, which is the standard the earlier plan set for it.
+An orchestration file for a single process is not.
+
+**Alternative considered.** No container at all, which was the position after
+D30. Rejected on the reproducibility point above: the cost is one file and the
+benefit is that the build instructions become verifiable rather than
+aspirational.
+
+A full deployment story — compose, health checks, a registry, an orchestrator —
+rejected under D30 for the same reasons as the rest of it.
+
+**Trade-off.** The image is a second build path to keep working, so it has to be
+built as part of M8 rather than written and left to rot. It also adds a second
+place where the toolchain version is pinned, which has to agree with what the
+README claims.
+
+**Measurement note.** Benchmark numbers must not be taken from inside the
+container. Development already happens in a VM (D14, ARCHITECTURE.md §8.5 item
+4), and measuring inside a container on top of that puts two layers between the
+number and the hardware. The container is for reproducing the *build* and
+running the program; §8 numbers come from a Release build on the host.

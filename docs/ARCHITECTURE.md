@@ -54,14 +54,13 @@ defending a shape that stopped earning its place.
   assignment and run-level aggregation are genuinely not the pool's business,
   and the two test suites exercise the two levels independently. See D27.
   Worth asking again at M6 if the CLI gives it no third responsibility.
-- **C2 — `Task` polymorphism (end of M5). RESOLVED: kept, with the
-  justification still owed.** The two types differ in kind, not by a parameter:
+- **C2 — `Task` polymorphism (end of M5). CLOSED: kept.** The two types differ in kind, not by a parameter:
   one burns a core, the other occupies a worker without one. But nothing
   dispatches on type at runtime — verified, no `dynamic_cast` or `typeid`
-  anywhere — so `std::function<void()>` would currently suffice. C2 requires
-  both conditions to collapse and only one holds. **Re-examine at M11**: if the
-  broker factory does not produce real runtime type selection, delete the
-  hierarchy rather than let this lapse. See D28.
+  anywhere. C2 requires both conditions to collapse and only one holds.
+  **Closed by D30**, not deferred: the milestone that would have supplied
+  runtime type selection no longer exists, so the checkpoint was re-decided on
+  the evidence that remains rather than postponed again. See D28 and D30.
 
 ---
 
@@ -95,7 +94,8 @@ defending a shape that stopped earning its place.
                                     |  C++17 standard lib |
                                     +---------------------+
 
-   Later, strictly above app/:  api/ (M10)  ·  messaging/ (M11)  ·  docker/ (M12)
+   Nothing sits above app/. Service, messaging and deployment layers were
+   removed from the roadmap by D30.
 ```
 
 ### 1.1 Invariants of the graph
@@ -105,9 +105,11 @@ defending a shape that stopped earning its place.
 - `concurrency/` and `metrics/` are siblings that **do not know about each
   other**. The pool *collects* `Sample`s; `metrics/` *aggregates* them; the two
   never meet.
-- Nothing below `app/` includes anything from `cli/`, `api/`, `messaging/`, or
-  `docker/`. The C++ core must remain buildable, testable, and benchmarkable
-  with no HTTP, AMQP, or container concepts anywhere in its dependency closure.
+- Nothing below `app/` includes anything from `cli/`. The core remains
+  buildable, testable and benchmarkable with no HTTP, AMQP or container
+  concepts anywhere in its dependency closure — a property that is now trivially
+  satisfied, since D30 removed those layers from the roadmap, but which is still
+  what keeps the core testable in isolation.
 
 ### 1.2 Module responsibilities
 
@@ -117,7 +119,7 @@ defending a shape that stopped earning its place.
 | `concurrency/` | The two reusable synchronization primitives, testable in isolation. | `BlockingQueue<T>`, `ThreadPool` | M3, M4 |
 | `execution/` | Policy: assigns identity, stamps submission, owns pool lifetime, aggregates results. | `TaskEngine` | M5 |
 | `metrics/` | Aggregation of timing samples, kept out of the hot path by construction so measurement cannot distort what it measures. | `RunSummary`, `summarize()` | M5, M8 |
-| `tasks/` | Concrete workloads. Neither vocabulary, mechanism nor policy: the CLI, the benchmark driver and the eventual broker factory each reach for these independently. | `ComputeTask`, `SleepTask` | M5 |
+| `tasks/` | Concrete workloads. Neither vocabulary, mechanism nor policy: the CLI and the benchmark driver each reach for these independently. | `ComputeTask`, `SleepTask` | M5 |
 | `cli/` | Argument parsing, validation, exit codes. Nothing else. | `Options`, `parse_args()` | M6 |
 | `app/` | Composition root: the single place that constructs concrete objects and wires them, keeping everything below it injectable and testable. | `main()`, `run()` | M1, M6 |
 | `tests/` | Unit, concurrency, and stress coverage. | — | M1 onward |
@@ -198,7 +200,7 @@ exists to avoid.
 
 | Thread | Count | Created by | Lifetime |
 |---|---|---|---|
-| Submitter | >= 1 (main in M6; broker consumer in M11) | caller | outside the engine |
+| Submitter | >= 1 (main thread via the CLI at M6; any caller thread) | caller | outside the engine |
 | Worker | exactly `N` | `ThreadPool` constructor | joined in `shutdown()` |
 
 **No thread-per-task, ever (I4).** The pool constructor is the only thread
@@ -422,11 +424,11 @@ interface.
 `Task` is polymorphic, owned by `std::unique_ptr<Task>` (D1). The abstraction
 carries an obligation rather than a demonstration.
 
-**Why polymorphism is structurally load-bearing:** at M11 a broker message is
-deserialized and its payload *selects the concrete task type at runtime*. A
-factory returning `std::unique_ptr<Task>` is the natural shape for that, and the
-type cannot be known at compile time. That is a genuinely open set of types,
-which is what virtual dispatch is for.
+**Why the hierarchy earns its place.** The original argument was a runtime
+factory selecting a concrete type from a broker payload. That milestone is gone
+(D30), so the case now rests entirely on the two types differing in *kind*
+rather than by a parameter — which they do, and which is what checkpoint C2
+actually required. See D28 and D30 for the closed verdict.
 
 **Two real implementations, landing at M5:**
 
@@ -627,11 +629,14 @@ host and editor environment only.
 The repository must live on the **ext4 filesystem inside WSL**, not under
 `/mnt/...`. The 9p bridge makes git and CMake substantially slower and reports
 incorrect file modes to Linux tools, which breaks executable bits and
-permissions. Milestone 9 (`ps`, `vmstat`, signal handling, graceful
-termination) has no meaningful Windows equivalent.
+permissions. The operational observation folded into Milestone 7 (`ps`,
+`vmstat`, signal handling, graceful termination) has no meaningful Windows
+equivalent.
 
 Consequence for measurement: see [§8.5](#85-validity-threats--stated-not-hidden),
-item 4.
+item 4. The M8 container (D31) exists to make the build reproducible off this
+host; it is not a measurement environment, because a container on top of a VM
+puts two layers between a number and the hardware.
 
 ---
 
@@ -641,11 +646,14 @@ Current count: **one** — GoogleTest, and only in the test build. The product
 library and the executable link nothing outside the C++ standard library. Each
 dependency is justified before it is added (I7).
 
+With the roadmap ending at M8 (D30), this is also the **final** count: no
+further dependency is planned. The M8 container (D31) pins a base image, which
+is a build input rather than something the library links against.
+
 | Dependency | Milestone | Why the standard library is insufficient | Alternative considered |
 |---|---|---|---|
 | GoogleTest (FetchContent, pinned commit) | M1 | C++17 has no test framework; CTest alone provides no assertions or fixtures. Source build also gives TSan instrumentation ([§9.3](#93-why-googletest-is-built-from-source)). | Catch2 (viable); hand-rolled asserts — rejected, poor diagnostics |
 | *(none)* for benchmarking | M8 | End-to-end throughput and per-task percentiles come directly from `<chrono>` | Google Benchmark — rejected: built for microbenchmarks, does not fit whole-pipeline measurement |
-| JSON library | M11 only | needed to parse broker message payloads | to be justified at M11 |
 
 ---
 
@@ -657,12 +665,12 @@ arrives, not before ([§0.1](#01-incrementalism)).
 ```
 task-engine/
 |-- CLAUDE.md   PLAN.md   README.md   .gitignore
+|-- Dockerfile       multi-stage build of the CLI (M8, D31)
 |-- docs/            ARCHITECTURE.md   DECISIONS.md
 |-- include/taskengine/{core,concurrency,execution,metrics}/
 |-- src/{core,concurrency,execution,metrics,cli,app}/
 |-- tests/           unit/  concurrency/  stress/
 |-- benchmarks/
-`-- (M10+) api/   messaging/   docker/
 ```
 
 One library target `taskengine` (D7), one CLI binary `task-engine`, one
@@ -675,9 +683,12 @@ Namespace is flat `taskengine` (D8); the directory conveys the module.
 
 ## 14. Open items
 
-| # | Item | Blocks |
-|---|---|---|
-| O1 | WSL2 target path for the repository (proposed `~/projects/task-engine`), and whether `PLAN.md`/`CLAUDE.md` carry over as the first commit | Task 0.2 |
-| O3 | M11 broker message format is unspecified; the JSON dependency is justified at that milestone | M11 only |
+None outstanding.
 
-O2 is closed: it is now checkpoint C1 in [§0.3](#03-planned-checkpoints).
+| # | Item | Resolution |
+|---|---|---|
+| O1 | WSL2 target path, and whether `PLAN.md`/`CLAUDE.md` carry over | Resolved at Task 0.2: `~/projects/task-engine` on ext4; both files carried over in the first commit. |
+| O2 | Whether `TaskEngine` is too thin to justify | Became checkpoint C1 in [§0.3](#03-planned-checkpoints); resolved at M5 (D27), with one more honest look due at the end of M6. |
+| O3 | Broker message format and the JSON dependency | Removed with the roadmap it belonged to (D30). |
+
+The only open architectural question left is C1, and it has a scheduled date.

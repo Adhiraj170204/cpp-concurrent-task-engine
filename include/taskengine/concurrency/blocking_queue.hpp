@@ -14,11 +14,12 @@ namespace taskengine {
 
 // A bounded, thread-safe producer/consumer queue.
 //
-// Bounded on purpose. An unbounded queue turns a producer/consumer rate
-// mismatch into unbounded memory growth and hides it; a full queue blocks its
-// producers instead, which is the honest behaviour for something that will
-// later be fed by a message broker, and it is what makes a queue-wait
-// measurement mean anything.
+// Bounded on purpose. An unbounded queue turns a producer/consumer rate mismatch
+// into unbounded memory growth and hides it; a full queue blocks its producers
+// instead, which is the honest behaviour and is what makes a queue-wait
+// measurement mean anything. With an unbounded queue, wait time is an artefact
+// of how much the queue was willing to buffer rather than a property of the
+// system.
 //
 // Shared mutable state is the deque and the closed flag. Both are guarded by
 // mutex_, which is the only mutex in the class, so a lock-order inversion is

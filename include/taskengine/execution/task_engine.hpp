@@ -22,11 +22,10 @@ namespace taskengine {
 // samples per worker and counts refusals, but it has no idea what a summary is.
 //
 // Everything else is delegation, deliberately. The pool is a reusable
-// concurrency primitive that can be tested against hand-built envelopes; this
-// is the application-facing surface that the CLI, and later the HTTP and broker
-// layers, talk to. Keeping them apart is what lets the pool be exercised
-// without any notion of task identity, and lets this be exercised without
-// reaching into envelopes.
+// concurrency primitive, tested against hand-built envelopes; this is the
+// application-facing surface the CLI talks to. Keeping them apart is what lets
+// the pool be exercised with no notion of task identity, and lets this be
+// exercised without reaching into envelopes.
 //
 // Shutdown semantics are the pool semantics, unchanged: shutdown() drains,
 // shutdown_now() abandons what is queued, neither interrupts a running task,
