@@ -1094,3 +1094,69 @@ container. Development already happens in a VM (D14, ARCHITECTURE.md §8.5 item
 4), and measuring inside a container on top of that puts two layers between the
 number and the hardware. The container is for reproducing the *build* and
 running the program; §8 numbers come from a Release build on the host.
+
+---
+
+## D32 — CLI shape: no subcommand, five flags, and a hand-written parser
+
+**Status:** Accepted · **Milestone:** M6
+
+**Decision.** `task-engine [options]` with no verb. Five options — `--workers`,
+`--tasks`, `--work`, `--queue-capacity`, `--fail-every` — plus `--help`/`-h` and
+`--version`. Parsing is hand-written against `<charconv>`, lives in `cli/`, and
+is a pure function from already-split arguments to a decision. The exit-code
+contract lives in `cli/` as a separate testable function.
+
+**Reason — no subcommand.** PLAN.md sketched
+`task-engine run --workers N ...` but said in the same breath that the exact CLI
+was not fixed. A mandatory verb with exactly one permitted value is ceremony: it
+makes every invocation longer and every error message worse, in exchange for
+reserving grammar for verbs that the reduced scope (D30) says will never exist.
+That is precisely the structure-for-hypothetical-futures that §0.1 rule 2
+forbids. One tool, one job, no verb. A stray positional word is therefore an
+error rather than something silently ignored, which is what catches `run` being
+typed out of habit.
+
+**Reason — `--fail-every` exists.** Without it the documented exit code 1 is
+unreachable from a shell: every task would succeed, so the failure branch of the
+exit-code contract could never be demonstrated or tested end to end. It is fault
+injection and the help text says so. M6 has to verify that a failed run reports
+the correct status, and this is the only honest way to produce one.
+
+**Reason — hand-written parsing.** Five flags do not justify a dependency (I7),
+and the whole parser is about 120 lines. `std::from_chars` rather than `stoull`
+or a stream: it does not throw, is unaffected by the locale, reports overflow as
+a distinct condition, and returns where it stopped — which is how `12abc` gets
+rejected instead of quietly becoming 12. A leading minus is not part of the
+unsigned grammar it accepts, so negative input is rejected without a special
+case.
+
+**Reason — the shapes chosen for testability.** `parse_args` takes a
+`vector<string_view>` rather than `argc`/`argv`, so the entire parser is
+exercised without starting a process; there are 20 unit tests over it.
+`exit_code_for(failed, rejected)` is a separate function taking plain counts
+rather than a `RunSummary`, so the contract is unit-testable and `cli/` does not
+acquire a dependency on `metrics/`. Validation of `--workers 0` happens in
+`parse_args` rather than being left to the engine constructor, so the message
+names the flag the user typed instead of an internal precondition.
+
+**Alternative considered.** A CLI library — CLI11 or cxxopts. Both are good, and
+both would be a second dependency for five flags in a project whose dependency
+count is otherwise one, test-only. Rejected under I7.
+
+Returning the counts through the futures instead of the run summary — rejected:
+the summary already has them, and holding N futures alive to recount what has
+already been counted would make memory scale with `--tasks` for no benefit. The
+CLI discards each future, which is safe because a future backed by a promise,
+unlike one from `std::async`, does not block when destroyed.
+
+**Trade-off.** The parser accepts only space-separated values: `--workers=8` is
+not recognised, and short flags cannot be combined. Both are conventional in
+larger tools and neither is needed here, but they are absences rather than
+oversights. Adding either later is a change to one function.
+
+**On the numbers it prints.** The report includes wall time and throughput,
+which are real measurements of that invocation, and it says so in the output:
+single run, no warm-up, not a benchmark. Repeatable measurement — warm-up,
+repeats, medians, environment capture — is M8 with its own binary. The CLI must
+not become the thing whose numbers get quoted.

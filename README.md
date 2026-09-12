@@ -4,13 +4,12 @@ A concurrent task-processing engine in C++17. The project is a study of
 ownership, lifetime and concurrency correctness rather than a feature exercise:
 every abstraction in it has to justify its own existence.
 
-> **Status: Milestone 5 — engine, metrics and workloads.**
-> The engine runs: submit a task, get a `std::future<TaskResult>` back, shut
-> down, read what the run did. Task ids, state transitions, queue-wait and
-> execution timing, and percentile summaries all work. `task-engine` itself
-> still only prints its version — the CLI is M6, and honest benchmark
-> numbers are M8. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-> describes the design they will follow.
+> **Status: Milestone 6 — command-line interface.**
+> The engine runs from the command line: submit a configurable workload,
+> get a report of what happened, and an exit code that distinguishes a clean
+> run from one that lost work. Remaining: sanitizer and failure-mode
+> hardening (M7), then benchmarking, packaging and polish (M8).
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) describes the design.
 
 ## Requirements
 
@@ -111,13 +110,71 @@ To shake out interleavings rather than sampling one:
 ctest --test-dir build/tsan -L concurrency --repeat until-fail:25
 ```
 
-## Run
+## Usage
 
 ```bash
-./build/debug/task-engine
+./build/release/task-engine --workers 8 --tasks 10000 --work 500
 ```
 
-Prints the program name and version. That is all it does at this milestone.
+| Option | Default | Meaning |
+|---|---|---|
+| `--workers N` | hardware concurrency | worker threads |
+| `--tasks N` | 1000 | tasks to submit |
+| `--work N` | 1000 | compute iterations per task; `0` submits empty tasks |
+| `--queue-capacity N` | 1024 | bounded queue capacity |
+| `--fail-every N` | 0 (never) | make every Nth task throw — fault injection |
+| `-h`, `--help` | | print help and exit |
+| `--version` | | print the version and exit |
+
+`--help` carries the same table plus the exit codes, so the interface is
+documented at the prompt and not only here.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | every task succeeded |
+| `1` | the run completed, but at least one task failed or was rejected |
+| `2` | invalid usage or configuration |
+
+A partially successful run is never reported as success. Diagnostics go to
+stderr, so a caller redirecting stdout still sees why nothing came out of it.
+
+### Examples
+
+```bash
+# a clean run
+task-engine --workers 8 --tasks 5000 --work 2000        # exit 0
+
+# exercise the failure path: every 10th task throws
+task-engine --tasks 100 --work 100 --fail-every 10       # exit 1, 10 failed
+
+# engine overhead with no work in the tasks
+task-engine --workers 1 --tasks 20000 --work 0           # exit 0
+
+# a usage mistake
+task-engine --workers 0                                  # exit 2
+```
+
+Sample output:
+
+```
+outcome
+  submitted        5000
+  succeeded        5000
+  failed           0
+  rejected         0
+
+  durations              min         p50         p95         max        mean
+  queue wait        275.00ns      6.69us     46.68us    264.79us     10.80us
+  execution           1.38us      1.56us      1.61us     14.94us      1.62us
+  latency             1.80us      8.27us     48.54us    266.40us     12.42us
+```
+
+The wall time and throughput the CLI prints are real measurements of that one
+invocation, and the output says so: single run, no warm-up, not a benchmark.
+Repeatable measurement — warm-up, repeats, medians, environment capture — is a
+separate concern and arrives with its own binary at M8.
 
 ## Layout
 
@@ -125,7 +182,9 @@ Prints the program name and version. That is all it does at this milestone.
 CMakeLists.txt              project, C++17, warning policy, targets
 include/taskengine/         public headers
 src/                        library sources and the executable entry point
+include/taskengine/cli/     argument parsing, validation, exit codes
 include/taskengine/tasks/   concrete workloads (ComputeTask, SleepTask)
+src/app/main.cpp            composition root
 tests/unit/                 unit suite (CTest label: unit)
 tests/concurrency/          threaded suite (CTest label: concurrency)
 docs/                       architecture and decision records
