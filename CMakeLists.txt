@@ -84,3 +84,16 @@ add_executable(task-engine
 target_link_libraries(task-engine PRIVATE taskengine)
 
 target_compile_options(task-engine PRIVATE ${TASKENGINE_WARNINGS})
+
+# ---------------------------------------------------------------------------
+# Tests
+# The option exists because FetchContent resolves GoogleTest at *configure*
+# time and therefore needs the network. Without a switch the project could not
+# be configured offline, or in a container that has no reason to build tests.
+# ---------------------------------------------------------------------------
+option(TASKENGINE_BUILD_TESTS "Build the test suite" ON)
+
+if(TASKENGINE_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
