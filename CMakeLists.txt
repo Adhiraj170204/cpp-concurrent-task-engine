@@ -93,6 +93,7 @@ endif()
 # deployment story, and no rpath or ABI concerns in the M12 container.
 # ---------------------------------------------------------------------------
 add_library(taskengine STATIC
+    src/cli/options.cpp
     src/concurrency/thread_pool.cpp
     src/core/task.cpp
     src/core/task_envelope.cpp
@@ -126,7 +127,7 @@ target_compile_definitions(taskengine PRIVATE
 # Executable: task-engine
 # ---------------------------------------------------------------------------
 add_executable(task-engine
-    src/main.cpp)
+    src/app/main.cpp)
 
 target_link_libraries(task-engine PRIVATE taskengine)
 

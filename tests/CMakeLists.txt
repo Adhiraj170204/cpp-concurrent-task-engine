@@ -31,6 +31,7 @@ FetchContent_MakeAvailable(googletest)
 # ---------------------------------------------------------------------------
 add_executable(taskengine_unit_tests
     unit/blocking_queue_test.cpp
+    unit/options_test.cpp
     unit/run_summary_test.cpp
     unit/task_envelope_test.cpp
     unit/task_result_test.cpp
