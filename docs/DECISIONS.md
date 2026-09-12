@@ -823,3 +823,135 @@ task running on the same pool. `submit` can deadlock against a full queue only
 that worker could drain, and either shutdown would have the worker join itself.
 Documented on the class, in the same family as the recursive-submit hazard in
 D5.
+
+---
+
+## D27 — Checkpoint C1 resolved: `TaskEngine` is kept
+
+**Status:** Accepted · **Milestone:** M5 · **Resolves:** checkpoint C1 (ARCHITECTURE.md §0.3)
+
+**The question C1 asked.** If `TaskEngine` turns out to be only pass-through
+wiring over `ThreadPool` — id assignment and nothing more — merge it, and do not
+keep it for the shape of the diagram.
+
+**The measurement.** 21 non-comment lines of implementation. Of its seven public
+members, four (`shutdown`, `shutdown_now`, `worker_count`, `is_shut_down`)
+forward straight to the pool and nothing else. That is genuinely thin, and
+pretending otherwise would be the exact failure C1 exists to catch.
+
+**Decision.** Keep it, on the strength of two things that are not forwarding and
+are not the pool's business.
+
+*Identity.* `next_id_` is state the pool does not have and should not acquire.
+The pool moves envelopes; it has no opinion about what a task is called.
+
+*The notion of a run.* `summary()` combines per-worker sample buffers with the
+refusal count and aggregates them. The pool records raw data; it has no concept
+of a run having happened.
+
+The clinching evidence is in the test files rather than the headers. The pool
+suite builds `TaskEnvelope`s by hand and never once mentions an id or a summary;
+the engine suite submits `unique_ptr<Task>` and never mentions an envelope.
+Those are two different interfaces at two different levels, and each is testable
+without the other. `submit(TaskEnvelope) -> bool` and
+`submit(unique_ptr<Task>) -> future<TaskResult>` are not the same function with
+a wrapper around it.
+
+**Alternative considered.** Merge, saving roughly sixty lines and one
+indirection. The cost is that `ThreadPool` becomes simultaneously a reusable
+concurrency primitive and the application-facing API, its test suite mixes
+envelope-level with task-level concerns, and the HTTP and broker layers at M10
+and M11 end up depending on a class called `ThreadPool`. That is a worse
+repository for a smaller one.
+
+**Trade-off.** Four forwarding methods, honestly. If M6 and the CLI do not give
+`TaskEngine` a third real responsibility, this is worth asking again rather than
+treating as settled.
+
+---
+
+## D28 — Checkpoint C2 resolved: the `Task` hierarchy is kept, with the justification still owed
+
+**Status:** Accepted, **with a caveat** · **Milestone:** M5 · **Resolves:** checkpoint C2 (ARCHITECTURE.md §0.3)
+
+**The question C2 asked.** If the concrete task types differ only by a parameter
+**and** nothing dispatches on type at runtime, collapse the hierarchy to
+`std::function<void()>` and delete it.
+
+**The measurement.** Two conditions, and they do not agree.
+
+*Do they differ only by a parameter?* No. `ComputeTask` burns a core;
+`SleepTask` occupies a worker while consuming no core at all. They respond to
+worker count in opposite ways, which is the entire reason the benchmark plan
+needs both: one shows speedup flattening at the core count, the other shows
+throughput scaling far past it. Collapsing them into one type with a flag would
+be worse code, not less code.
+
+*Does anything dispatch on type at runtime?* **No.** Verified rather than
+assumed: there is no `dynamic_cast` and no `typeid` anywhere in `include/` or
+`src/`. Today, `std::function<void()>` would in fact suffice for everything the
+engine does.
+
+**Decision.** Keep it, because C2 requires *both* conditions to collapse and
+only one holds. But the honest position is that the strongest argument for
+polymorphism — a factory at M11 choosing a concrete type from a broker message
+payload — has not arrived, and until it does the hierarchy is carrying its
+weight on the first condition alone.
+
+**Re-examine at M11.** If the broker layer does not produce a genuine runtime
+type selection, this should be revisited properly rather than allowed to lapse
+by default. A virtual call per task on a hierarchy nothing dispatches over is an
+abstraction waiting to be deleted.
+
+**Trade-off.** One heap allocation and one virtual call per task, which the
+overhead-floor measurement at M8 will put a number on instead of leaving it as
+an assertion.
+
+---
+
+## D29 — Metrics are a pure function, and refuse to answer early
+
+**Status:** Accepted · **Milestone:** M5
+
+**Decision.** `summarize()` is a free function over a `std::vector<Sample>` and
+a refusal count. It touches no clock, no thread and no shared state.
+`ThreadPool::collect_samples()` throws `std::logic_error` if the workers have
+not been joined, and `TaskEngine::summary()` inherits that. Percentiles use
+nearest rank, computed in integer arithmetic, with the index function exposed so
+it can be tested directly.
+
+**Reason.** Three separate points.
+
+*Pure function.* It makes percentile arithmetic testable against hand-computed
+answers with no threads in sight — the empty sample, one sample, two samples,
+and an unsorted input all get direct tests. It also makes the measurement code
+structurally incapable of perturbing what it measures.
+
+*Refusing early.* Reading the per-worker buffers while workers are still
+appending is a data race. The alternative to throwing is returning whatever
+happens to be there, which would look like an answer and would not be one. A
+summary of an unfinished run is precisely the kind of "partial success presented
+as success" the project forbids.
+
+*Nearest rank in integers.* "p95" means different things in different tools, and
+a benchmark number nobody can reproduce is worth nothing. The definition is
+written down, the arithmetic is exact, and `nearest_rank_index` is public so the
+hand-worked ranks are checked rather than trusted.
+
+**Alternative considered.** Linear interpolation between neighbouring ranks,
+which most statistics packages default to. It produces values that never
+occurred in the sample, which is misleading for latency: a reported p95 should
+be a latency some task actually experienced.
+
+Returning an empty summary instead of throwing before shutdown — rejected under
+the same rule as above.
+
+**Trade-off.** `summarize` sorts a copy of the durations, so an N-task run costs
+three sorts and about 3N durations of scratch memory at summary time. That is
+off the hot path by construction: it runs once, after the workers have stopped.
+
+**Related.** `Sample` lands here rather than at M2, as D21 scheduled, now that
+there is a consumer for it. Concrete task types live in a new `tasks/` module:
+they are neither vocabulary (`core/`) nor mechanism (`concurrency/`) nor policy
+(`execution/`), they are workloads, and the CLI, the benchmark driver and the
+eventual broker factory all reach for them independently.

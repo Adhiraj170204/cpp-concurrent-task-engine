@@ -1,6 +1,7 @@
 #ifndef TASKENGINE_CORE_TASK_ENVELOPE_HPP
 #define TASKENGINE_CORE_TASK_ENVELOPE_HPP
 
+#include "taskengine/core/sample.hpp"
 #include "taskengine/core/task.hpp"
 #include "taskengine/core/task_id.hpp"
 #include "taskengine/core/task_result.hpp"
@@ -36,7 +37,12 @@ public:
     // requires; a second call throws future_already_retrieved.
     [[nodiscard]] std::future<TaskResult> get_future();
 
-    // Runs the task and fulfils the promise with the outcome.
+    // Runs the task, fulfils the promise with the outcome, and returns the
+    // compact record of what happened for the metrics path.
+    //
+    // Returning a Sample rather than a TaskResult keeps the recording path free
+    // of the error string: the message goes to the caller through the promise,
+    // the measurement stays trivially copyable.
     //
     // noexcept because this executes directly on a worker thread, where an
     // escaping exception would call std::terminate. A throwing task is an
@@ -49,10 +55,10 @@ public:
     //
     // Precondition: the envelope has not been moved from and has not already
     // been run or rejected.
-    void run(TimePoint dequeued) noexcept;
+    Sample run(TimePoint dequeued) noexcept;
 
     // Fulfils the promise as Rejected: this task was never handed to a worker,
-    // so it has no execution window.
+    // so it has no execution window and produces no sample.
     void reject(TimePoint finished) noexcept;
 
     [[nodiscard]] TaskId id() const noexcept { return id_; }

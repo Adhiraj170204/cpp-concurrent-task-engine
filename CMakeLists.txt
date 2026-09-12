@@ -96,6 +96,10 @@ add_library(taskengine STATIC
     src/concurrency/thread_pool.cpp
     src/core/task.cpp
     src/core/task_envelope.cpp
+    src/execution/task_engine.cpp
+    src/metrics/run_summary.cpp
+    src/tasks/compute_task.cpp
+    src/tasks/sleep_task.cpp
     src/version.cpp)
 
 target_include_directories(taskengine PUBLIC

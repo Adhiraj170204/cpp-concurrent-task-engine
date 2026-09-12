@@ -49,13 +49,19 @@ is a defect regardless of whether the tests pass.
 Points where the design has committed to re-examining itself rather than
 defending a shape that stopped earning its place.
 
-- **C1 — `TaskEngine` (end of M5).** If `TaskEngine` is only pass-through
-  wiring over `ThreadPool` — ID assignment and nothing more — merge it into
-  `ThreadPool`. Do not preserve it for architectural appearance. See
-  [§2.3](#23-o2-the-taskengine-checkpoint).
-- **C2 — `Task` polymorphism (end of M5).** If the concrete task types differ
-  only by a parameter and nothing dispatches on type at runtime, collapse to
-  `std::function<void()>` and delete the hierarchy. See [§7](#7-task-implementations).
+- **C1 — `TaskEngine` (end of M5). RESOLVED: kept.** 21 lines of
+  implementation, four of seven public members pure forwarding — but id
+  assignment and run-level aggregation are genuinely not the pool's business,
+  and the two test suites exercise the two levels independently. See D27.
+  Worth asking again at M6 if the CLI gives it no third responsibility.
+- **C2 — `Task` polymorphism (end of M5). RESOLVED: kept, with the
+  justification still owed.** The two types differ in kind, not by a parameter:
+  one burns a core, the other occupies a worker without one. But nothing
+  dispatches on type at runtime — verified, no `dynamic_cast` or `typeid`
+  anywhere — so `std::function<void()>` would currently suffice. C2 requires
+  both conditions to collapse and only one holds. **Re-examine at M11**: if the
+  broker factory does not produce real runtime type selection, delete the
+  hierarchy rather than let this lapse. See D28.
 
 ---
 
@@ -111,6 +117,7 @@ defending a shape that stopped earning its place.
 | `concurrency/` | The two reusable synchronization primitives, testable in isolation. | `BlockingQueue<T>`, `ThreadPool` | M3, M4 |
 | `execution/` | Policy: assigns identity, stamps submission, owns pool lifetime, aggregates results. | `TaskEngine` | M5 |
 | `metrics/` | Aggregation of timing samples, kept out of the hot path by construction so measurement cannot distort what it measures. | `RunSummary`, `summarize()` | M5, M8 |
+| `tasks/` | Concrete workloads. Neither vocabulary, mechanism nor policy: the CLI, the benchmark driver and the eventual broker factory each reach for these independently. | `ComputeTask`, `SleepTask` | M5 |
 | `cli/` | Argument parsing, validation, exit codes. Nothing else. | `Options`, `parse_args()` | M6 |
 | `app/` | Composition root: the single place that constructs concrete objects and wires them, keeping everything below it injectable and testable. | `main()`, `run()` | M1, M6 |
 | `tests/` | Unit, concurrency, and stress coverage. | — | M1 onward |
