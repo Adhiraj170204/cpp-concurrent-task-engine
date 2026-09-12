@@ -436,6 +436,18 @@ TEST(ThreadPool, EveryFutureIsFulfilledExactlyOnceUnderLoadAndAbortShutdown) {
             });
         }
 
+        // Wait until submission is genuinely under way before aborting.
+        //
+        // Without this, the abort can close the queue before any submitter
+        // thread has reached its first push, so every submission is refused and
+        // the accepted path is never exercised -- which showed up as a flake
+        // under AddressSanitizer, where thread start-up is slower. This is not
+        // a timing guess: the pool is open and the queue has capacity, so the
+        // predicate is certain to become true.
+        while (accepted.load(std::memory_order_relaxed) == 0) {
+            std::this_thread::yield();
+        }
+
         pool.shutdown_now();
 
         for (auto& submitter : submitters) {
