@@ -107,14 +107,21 @@ defending a shape that stopped earning its place.
 
 | Module | Reason to exist | Owns | Milestone |
 |---|---|---|---|
-| `core/` | The vocabulary every other layer speaks. Pure data plus one abstract interface, zero concurrency — so the task model is unit-testable without threads. | `Task`, `TaskId`, `TaskState`, `TaskResult`, `TaskError`, `Sample` | M2 |
+| `core/` | The vocabulary every other layer speaks. Pure data plus one abstract interface, zero concurrency — so the task model is unit-testable without threads. | `Task`, `TaskId`, `TaskState`, `TaskResult`, `TaskError`, `TaskTimings`, `TaskEnvelope`, `Sample` | M2, M4 |
 | `concurrency/` | The two reusable synchronization primitives, testable in isolation. | `BlockingQueue<T>`, `ThreadPool` | M3, M4 |
-| `execution/` | Policy: binds a task's identity, lifecycle, timings, and result channel together; owns pool lifetime. | `TaskEngine`, `TaskEnvelope` | M5 |
+| `execution/` | Policy: assigns identity, stamps submission, owns pool lifetime, aggregates results. | `TaskEngine` | M5 |
 | `metrics/` | Aggregation of timing samples, kept out of the hot path by construction so measurement cannot distort what it measures. | `RunSummary`, `summarize()` | M5, M8 |
 | `cli/` | Argument parsing, validation, exit codes. Nothing else. | `Options`, `parse_args()` | M6 |
 | `app/` | Composition root: the single place that constructs concrete objects and wires them, keeping everything below it injectable and testable. | `main()`, `run()` | M1, M6 |
 | `tests/` | Unit, concurrency, and stress coverage. | — | M1 onward |
 | `benchmarks/` | Repeatable measurement driver, as a separate binary so benchmark-only code never links into the product path. | — | M8 |
+
+> **Correction (M4, D24).** `TaskEnvelope` was originally listed under
+> `execution/`. That contradicts the dependency direction in §1.1: `ThreadPool`
+> lives in `concurrency/` and owns a `BlockingQueue<TaskEnvelope>` per §2.1, so
+> the envelope cannot belong to the layer above it. It is pure data and
+> ownership with no concurrency or policy in it, so `core/` is its correct
+> home. See D24.
 
 **Why `metrics/` is aggregation-only.** Making it a pure function over a
 `std::vector<Sample>` means percentile logic is testable with hand-written

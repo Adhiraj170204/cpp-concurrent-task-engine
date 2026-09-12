@@ -31,6 +31,7 @@ FetchContent_MakeAvailable(googletest)
 # ---------------------------------------------------------------------------
 add_executable(taskengine_unit_tests
     unit/blocking_queue_test.cpp
+    unit/task_envelope_test.cpp
     unit/task_result_test.cpp
     unit/task_test.cpp
     unit/version_test.cpp)
@@ -58,7 +59,8 @@ gtest_discover_tests(taskengine_unit_tests
 # development, and so the threaded suite can be pointed at a TSan build.
 # ---------------------------------------------------------------------------
 add_executable(taskengine_concurrency_tests
-    concurrency/blocking_queue_concurrency_test.cpp)
+    concurrency/blocking_queue_concurrency_test.cpp
+    concurrency/thread_pool_test.cpp)
 
 target_link_libraries(taskengine_concurrency_tests PRIVATE
     taskengine

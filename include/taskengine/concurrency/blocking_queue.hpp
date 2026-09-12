@@ -8,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace taskengine {
 
@@ -122,6 +123,35 @@ public:
         // re-check the predicate, not just one of them.
         not_empty_.notify_all();
         not_full_.notify_all();
+    }
+
+    // Closes the queue and removes everything still in it, as one indivisible
+    // step, returning the removed items to the caller.
+    //
+    // Closing and draining separately would leave a window in which a consumer
+    // could dequeue an item after the close but before the drain, so that item
+    // would run when the caller had asked for it to be discarded. Doing both
+    // under one lock removes the window.
+    //
+    // The items are handed back rather than destroyed because the caller owns
+    // whatever obligations they carry: an abandoned task still has a caller
+    // waiting on its result, and dropping it silently would break that promise.
+    std::vector<T> close_and_drain() {
+        std::vector<T> drained;
+        {
+            const std::lock_guard<std::mutex> lock{mutex_};
+            closed_ = true;
+            drained.reserve(items_.size());
+            for (auto& item : items_) {
+                drained.push_back(std::move(item));
+            }
+            items_.clear();
+        }
+        // Producers waiting for space and consumers waiting for work both have
+        // to re-check: the queue is now closed and empty.
+        not_empty_.notify_all();
+        not_full_.notify_all();
+        return drained;
     }
 
     [[nodiscard]] bool is_closed() const {

@@ -691,3 +691,135 @@ slightly noisier and is the point. `size()` is exposed but is a momentary
 snapshot, useless for control flow and documented as such; it exists for
 invariant checks such as "never above capacity" and for queue-depth reporting
 during benchmarking.
+
+---
+
+## D24 — `TaskEnvelope` lives in `core/`, not `execution/`
+
+**Status:** Accepted · **Milestone:** M4 (ARCHITECTURE.md §1.2 placed it in `execution/` at M5)
+
+**Decision.** `TaskEnvelope` is declared in `include/taskengine/core/` and is
+part of the `core/` module. ARCHITECTURE.md §1.2 is corrected accordingly.
+
+**Reason.** A genuine contradiction inside the approved architecture, not a
+preference. §1.1 fixes the dependency direction as `execution/ -> concurrency/
+-> core/`, and states that nothing below `app/` may depend upward. §2.1 shows
+`ThreadPool`, which lives in `concurrency/`, owning a
+`BlockingQueue<TaskEnvelope>`. Those two cannot both hold while `TaskEnvelope`
+belongs to `execution/`: the pool would depend on the layer above it and the
+graph would cease to be acyclic.
+
+`core/` is the correct home on the merits, not just to break the tie.
+`TaskEnvelope` is pure data and ownership — an id, a submission instant, a
+`unique_ptr<Task>` and a `promise<TaskResult>` — with no concurrency primitive,
+no scheduling policy and no knowledge of a queue or a pool. It is exactly the
+kind of vocabulary type §1.2 says `core/` exists to hold. `std::promise` is a
+standard-library type in the same sense `std::string` is; it is not a policy.
+
+**Alternative considered.** Make `ThreadPool` a template over the job type, so
+that `concurrency/` never names `TaskEnvelope` and the envelope can stay in
+`execution/`. That preserves §1.2 exactly and is defensible, but it pushes the
+worker loop and the exception boundary — the most delicate code in the project —
+into a template, and it moves the run-and-fulfil logic into the job type anyway.
+Rejected as more machinery than the problem justifies.
+
+Leaving `TaskEnvelope` in `execution/` and having `execution/` own the queue,
+with `ThreadPool` reduced to bare threads, was also considered. That contradicts
+§2.1 instead of §1.2 and makes the pool too thin to be worth naming.
+
+**Trade-off.** One row of §1.2 changes. `core/` now includes `<future>`, which
+is a slightly heavier standard header than the rest of that module pulls in. No
+dependency edge is added and the graph stays acyclic.
+
+---
+
+## D25 — The pool rejects what it refuses, rather than dropping it
+
+**Status:** Accepted · **Milestone:** M4
+
+**Decision.** `ThreadPool::submit` takes the envelope **by value**. When the
+queue refuses it, `submit` fulfils that envelope as `Rejected` before returning
+`false`. `shutdown_now` does the same for every envelope it drains. `run()` and
+`reject()` are `noexcept`.
+
+**Reason.** Invariant I3 says every future handed out is fulfilled exactly once.
+The tempting shortcut is to let a refused envelope fall out of scope: the
+standard then breaks the promise, and the caller gets
+`future_error(broken_promise)` from `get()` rather than hanging. That is not
+good enough. A broken promise is an exception the caller has to handle
+separately, it carries no id and no timings, and it is indistinguishable from an
+engine bug. Rejecting explicitly gives the caller the same shaped answer as
+every other outcome — a `TaskResult` in a terminal state — and keeps
+"was it accepted" and "what happened to it" consistent.
+
+This relies on `BlockingQueue::push` leaving its argument untouched when it
+refuses, which is documented on `push` and covered by a test.
+
+`noexcept` on `run()` is a statement about where it executes. It runs directly
+on a worker thread, where an escaping exception calls `std::terminate`, so the
+task boundary has to absorb everything — including throws that are not derived
+from `std::exception`, which become a `Failed` result reading
+`"unknown exception"` rather than a lost failure. What `noexcept` deliberately
+does **not** absorb is a double fulfilment, which would be an engine bug:
+terminating there is the right answer, because it means the pool has lost track
+of an envelope and some other caller is about to wait forever.
+
+**Alternative considered.** Returning the refused envelope to the caller
+(`std::optional<TaskEnvelope> submit(...)`) so the caller decides. More flexible,
+but it makes every call site responsible for the invariant, and a caller that
+ignores the returned envelope silently breaks a promise. Keeping the obligation
+with the code that owns it is the safer default.
+
+Using `promise::set_exception` for refusal — rejected for the same reasons as
+D4: a refusal is a countable outcome, not a control-flow event.
+
+**Trade-off.** `submit` has a side effect on failure, which has to be understood
+to be understood at all. It is stated on the declaration and is the subject of a
+test that asserts the returned future resolves to `Rejected` rather than
+throwing.
+
+---
+
+## D26 — Member declaration order in `ThreadPool` is a correctness requirement
+
+**Status:** Accepted · **Milestone:** M4
+
+**Decision.** `ThreadPool` declares `queue_` first and `threads_` last, and the
+header says why. The destructor calls `shutdown()`. `shutdown()` closes the
+queue and only then joins; `join_workers()` is guarded by its own mutex and a
+`joined_` flag.
+
+**Reason.** Members are destroyed in reverse declaration order, so `threads_`
+is destroyed before `queue_`. Workers hold a reference to the queue for their
+whole lifetime, so the queue has to outlive them. Swapping the two declarations
+would compile, pass a casual reading, and introduce a use-after-free that only
+appears during destruction — the hardest kind of bug to find by testing, since
+it depends on the allocator reusing freed memory.
+
+Close-before-join is the second half of the same ordering argument. Joining
+first would wait on workers that are still blocked in `pop()` for work that is
+never coming: a deadlock, not a slow shutdown. The rule is stated on
+`shutdown_mutex_` so a future edit has to notice it.
+
+`join_workers()` is guarded because `std::thread::join` on a thread that another
+thread is already joining is undefined behaviour, and both shutdown modes are
+documented as callable from any thread. `joined_` is set only after every join
+has returned, so a second caller cannot observe it as true while a thread is
+still being joined.
+
+The constructor also has to clean up after itself: if thread creation throws
+part way through, no destructor runs for the half-built pool, so the
+already-started workers would outlive it. The catch block closes the queue and
+joins them before rethrowing.
+
+**Alternative considered.** A comment saying "do not reorder" without the
+reasoning. It survives exactly as long as the person who wrote it.
+
+**Trade-off.** None worth the name; this is ordinary RAII discipline written
+down. The cost is a header comment longer than the declarations it guards.
+
+**Not supported.** Calling `submit`, `shutdown` or `shutdown_now` from inside a
+task running on the same pool. `submit` can deadlock against a full queue only
+that worker could drain, and either shutdown would have the worker join itself.
+Documented on the class, in the same family as the recursive-submit hazard in
+D5.

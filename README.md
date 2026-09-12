@@ -4,11 +4,12 @@ A concurrent task-processing engine in C++17. The project is a study of
 ownership, lifetime and concurrency correctness rather than a feature exercise:
 every abstraction in it has to justify its own existence.
 
-> **Status: Milestone 3 — blocking queue.**
-> The engine is not running tasks yet. What exists today is the CMake/C++17
-> foundation, the core task model, and a bounded thread-safe producer/
-> consumer queue with its concurrency suite. The thread pool, metrics, CLI
-> and benchmarks arrive in later milestones.
+> **Status: Milestone 4 — thread pool.**
+> The pieces run, but there is no user-facing engine yet. What exists today
+> is the CMake/C++17 foundation, the core task model, a bounded blocking
+> queue, and a worker pool with two shutdown modes. `task-engine` itself
+> still only prints its version; the engine wiring, metrics, CLI and
+> benchmarks arrive in later milestones.
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 > describes the design they will follow.
 
