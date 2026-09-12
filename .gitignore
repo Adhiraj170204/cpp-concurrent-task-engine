@@ -30,8 +30,15 @@ compile_commands.json
 *.d
 
 # Crash and debug artifacts. Expected while testing shutdown paths and UB.
-core
-core.*
+#
+# Anchored with a leading slash. An unanchored "core" matches any file OR
+# DIRECTORY named core at any depth, which silently excluded src/core/ and
+# include/taskengine/core/ from the repository: git add -A skipped them and
+# git status still reported a clean tree. Core dumps land in the working
+# directory of the crashing process, which is either the repository root or a
+# build tree that is already ignored.
+/core
+/core.[0-9]*
 vgcore.*
 
 # Sanitizer, coverage, and profiler output (D11).
