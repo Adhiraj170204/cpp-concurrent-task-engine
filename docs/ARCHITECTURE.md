@@ -53,7 +53,10 @@ defending a shape that stopped earning its place.
   implementation, four of seven public members pure forwarding — but id
   assignment and run-level aggregation are genuinely not the pool's business,
   and the two test suites exercise the two levels independently. See D27.
-  Worth asking again at M6 if the CLI gives it no third responsibility.
+  Re-examined at the end of M6 and closed: the CLI gave it no third
+  responsibility, but it drives the engine through `submit`, `shutdown` and
+  `summary` without ever naming an envelope, which is exactly the separation
+  it was kept for. See D34.
 - **C2 — `Task` polymorphism (end of M5). CLOSED: kept.** The two types differ in kind, not by a parameter:
   one burns a core, the other occupies a worker without one. But nothing
   dispatches on type at runtime — verified, no `dynamic_cast` or `typeid`
@@ -467,6 +470,13 @@ speedup teaches nothing. Being able to say *"here is where adding threads made
 it slower, and here is the mutex that caused it"* is the stronger and more
 honest result.
 
+> **Measured at M8 (D34).** Profiles A and C behaved as predicted. Profile B did
+> not rise at all: throughput fell from about a million tasks a second at one
+> worker to about 67 thousand at four. Over the same change voluntary context
+> switches rose from 0.08 to 1.21 per task, so the evidence points at wake-ups of
+> blocked workers on nearly every submission rather than at time spent holding the
+> queue mutex. The prediction above is left as written; this is the measurement.
+
 ### 8.2 The overhead floor
 
 A dedicated measurement — `work = 0`, `workers = 1` — establishes the engine's
@@ -475,10 +485,19 @@ Everything else is interpreted against it. The crossover where profile B becomes
 profile A is approximately where per-task work exceeds that floor; we report the
 **measured** value rather than assert a rule of thumb.
 
+> **Measured at M8 (D34).** About 0.76 to 0.81 µs per task end to end on one
+> worker, across two runs. With several workers and tiny tasks the effective
+> per-task cost rose to about 15 µs, dominated by wake-ups, so the crossover sits
+> well above the single-worker floor. The matrix brackets it rather than locating
+> it: a second worker cost more than 6× at 0.2 µs of work and gained 1.86–1.93× at
+> 142 µs.
+
 ### 8.3 Protocol
 
-- Parameters: `workers` in {1, 2, 4, 8, ... hardware_concurrency}, `tasks`,
-  `work`, `queue-capacity`, `profile`.
+- Worker counts {1, 2, 4, 8, 12, 16}, plus the hardware concurrency if it is not
+  already among them. Tasks, work, sleep duration and queue capacity are fixed
+  per profile inside the harness rather than exposed as flags, so a published
+  number cannot silently depend on how it was invoked (D34).
 - One **warm-up run, discarded**. Then **at least 5 repetitions**.
 - Report **median**, plus min and max. Never a single run; never a mean without
   spread.
@@ -501,12 +520,15 @@ Every CSV carries a header block: CPU model and logical core count
 
 1. **Benchmarks run in Release only, never under a sanitizer.** ASan is roughly
    2x and TSan 5–15x; a sanitized number is not a performance number. The
-   harness refuses to run if built with sanitizers enabled.
+   harness refuses to measure a sanitizer build, and also refuses a non-Release
+   build (D34). Only `--smoke`, which is explicitly not a measurement, runs in
+   any build.
 2. **The producer can become the bottleneck.** With one submitting thread and a
    bounded queue, if the producer is slower than the workers, the measurement is
    of the producer. Mitigation: report queue starvation alongside throughput,
    and size capacity so the queue stays non-empty. If it cannot, say so rather
-   than publish the number.
+   than publish the number. The harness records submission time separately from
+   wall time for exactly this reason, and D34 reports where it applied.
 3. **Queue capacity is a reported parameter**, because it materially changes
    results.
 4. **WSL2 is a virtual machine.** Numbers are valid for *relative* comparison
@@ -675,6 +697,7 @@ arrives, not before ([§0.1](#01-incrementalism)).
 task-engine/
 |-- CLAUDE.md   PLAN.md   README.md   .gitignore
 |-- Dockerfile       multi-stage build of the CLI (M8, D31)
+|-- .dockerignore    keeps host build trees out of the image build context
 |-- docs/            ARCHITECTURE.md   DECISIONS.md
 |-- include/taskengine/{core,concurrency,execution,metrics}/
 |-- src/{core,concurrency,execution,metrics,cli,app}/
@@ -697,7 +720,7 @@ None outstanding.
 | # | Item | Resolution |
 |---|---|---|
 | O1 | WSL2 target path, and whether `PLAN.md`/`CLAUDE.md` carry over | Resolved at Task 0.2: `~/projects/task-engine` on ext4; both files carried over in the first commit. |
-| O2 | Whether `TaskEngine` is too thin to justify | Became checkpoint C1 in [§0.3](#03-planned-checkpoints); resolved at M5 (D27), with one more honest look due at the end of M6. |
+| O2 | Whether `TaskEngine` is too thin to justify | Became checkpoint C1 in [§0.3](#03-planned-checkpoints); resolved at M5 (D27), re-examined at the end of M6 and closed (D34). |
 | O3 | Broker message format and the JSON dependency | Removed with the roadmap it belonged to (D30). |
 
-The only open architectural question left is C1, and it has a scheduled date.
+No architectural question remains open.

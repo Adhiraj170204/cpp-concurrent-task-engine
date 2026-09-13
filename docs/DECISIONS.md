@@ -1295,3 +1295,166 @@ so the queue is close to empty whenever the signal lands and the abort finds
 little or nothing to discard. That is a property of the workload, not a missed
 rejection, and it matters for benchmarking: a single submitter can bound
 throughput before the workers do (ARCHITECTURE.md §8.5, item 2).
+
+---
+
+## D34 — Benchmark harness, container build, and project completion
+
+**Status:** Accepted · **Milestone:** M8 (final)
+
+### The benchmark harness
+
+**Decision.** `bench-task-engine` runs a fixed matrix with no measurement flags:
+an overhead floor, a CPU-heavy profile, a lightweight profile and a blocking
+profile, across 1, 2, 4, 8, 12 and 16 workers. One discarded warm-up and five
+measured repetitions per configuration; median, minimum and maximum reported.
+Task objects are built and the engine and its threads constructed before the
+clock starts; the timed region runs from the first submit to the return of drain
+shutdown, and submission time is recorded separately inside it. Output is CSV
+with the environment in comment lines. The raw CSV of the published run is
+committed under `benchmarks/results/`.
+
+**Reason.** A benchmark whose parameters are flags invites a number that
+silently depends on how it was invoked, or on which invocation happened to look
+best. A fixed matrix makes every published figure reproducible by running one
+command. Recording submission time separately is ARCHITECTURE.md §8.5 item 2
+made concrete: with a single submitting thread, a run can be limited by the
+submitter rather than the workers, and the only honest response is to measure
+that rather than assume it away. Committing the raw CSV means every number in
+the README traces to an artefact produced by an actual run, with the machine it
+ran on written into it.
+
+**Stricter than the architecture.** §8.5 required the harness to refuse
+sanitizer builds. It also refuses non-Release builds: an unoptimised timing is
+not a timing of the program anyone would run. `--smoke` is exempt in every
+build, because it is explicitly not a measurement, and it is registered as a
+CTest integration test so the harness cannot quietly stop working.
+
+**Alternative considered.** A flag-driven benchmark tool — more flexible, and
+exactly the flexibility that makes results hard to trust. Google Benchmark —
+rejected at M0 (§12): built for microbenchmarks, not for whole-pipeline
+throughput with per-task percentiles.
+
+**Trade-off.** Changing the experiment means editing the harness and committing
+the change, which is the point.
+
+### What the measurements showed
+
+Two independent full runs, 94 s and 92 s, on an i5-12450H with 12 logical CPUs
+under WSL2, GCC 13.3.0, Release, one submitting thread, queue capacity 1024. Zero
+failed and zero rejected tasks in every configuration of both. Tables are in the
+README; the raw CSVs are in `benchmarks/results/`.
+
+**Blocking — as predicted.** 16.3× and 16.7× at 16 workers on 12 logical CPUs. The
+small superlinearity is explained by the data: execution p50 fell from 2.20 ms at
+one worker to 2.13 ms at sixteen as sleeps overran less on a busier machine.
+
+**CPU-heavy — as predicted, with a cause the model did not name.** 1.86–1.93× at
+two workers, 3.30× at four, 4.7–4.8× at eight, 5.1–5.8× at twelve and sixteen.
+Execution time for identical, deterministic work roughly doubled from 142–146 µs
+to 283–302 µs at eight workers and above, which is consistent with threads landing
+on Hyper-Threading siblings and efficiency cores. Without thread pinning the
+harness cannot apportion the effect between those and the WSL2 scheduler, so it
+is stated as consistent with, not attributed to.
+
+**Lightweight — not as predicted.** ARCHITECTURE.md §8.1 expected throughput to
+rise and then fall, with the single queue mutex as the bottleneck. It fell
+immediately: about 1.02–1.04 million tasks a second at one worker, 162–166
+thousand at two, about 67 thousand at four. Task execution stayed at 0.17–0.27 µs
+and submission was more than 99.7% of wall time throughout.
+
+The cause was measured rather than assumed. GNU `time -v` around the CLI with the
+same task sizes, three runs each, gave voluntary context switches per task of:
+
+| Workers | Voluntary switches per task | Tasks/s in those runs |
+|---:|---:|---:|
+| 1 | 0.079 – 0.081 | 929,594 – 1,001,421 |
+| 2 | 0.481 – 0.526 | 141,893 – 156,089 |
+| 4 | 1.205 – 1.214 | 66,331 – 67,775 |
+| 8 | 1.124 | 78,642 – 79,806 |
+
+The fifteen-fold rise in switches between one and four workers matches the
+fifteen-fold fall in throughput. With one worker the queue stays full and the
+worker never waits, so a notification finds no waiter and costs no system call.
+With several, workers empty the queue faster than one thread fills it — queue wait
+p50 drops from about 1 ms to 6–8 µs — and nearly every push has to wake one. For
+contrast, the CPU-heavy profile made 0.74 switches per task at one worker and
+0.31–0.34 at eight: a context switch is noise against 142 µs of work, and ruinous
+against 0.2 µs. The evidence therefore points at per-submission wake-ups rather
+than lock hold time. A system-call trace would confirm it directly; `strace` and
+`perf` were not available without root, so the claim rests on the switch counts
+and is worded accordingly. ARCHITECTURE.md §8.1 keeps the original prediction and
+now carries a note with the measurement beside it.
+
+**Overhead floor.** 1.32 and 1.23 million tasks a second across the two runs:
+about 0.76 to 0.81 µs per task end to end on one worker.
+
+**Stability.** Throughput medians agreed within 4% between runs for most
+configurations. The overhead floor differed by 6.9%, and configurations at 12 or
+16 workers by up to 12.7%. The CPU-heavy ordering between 12 and 16 workers
+reversed between runs, so none is claimed.
+
+**Trade-off made visible.** The engine notifies a waiter on every push with one
+mutex, which is the simplest correct design and the one D5 and D23 chose. These
+measurements put a price on that simplicity: nothing measurable for large tasks,
+and a fifteen-fold slowdown for tasks near a fifth of a microsecond. The design is
+left as it is; the price is documented rather than hidden.
+
+### The container build
+
+**Decision.** The Dockerfile's build stage compiles the project in Release and
+runs the unit, concurrency and integration suites; the image is produced only if
+they pass inside it. The runtime stage copies the one binary onto the same
+pinned base and runs it as an unprivileged system user. A `.dockerignore`
+accompanies it.
+
+**Reason.** Running the suites in the build stage turns "reproducible build"
+from a claim into a check performed on every image build. Stress tests are
+excluded: they exist to be judged by ThreadSanitizer on the host, and repeating
+them inside every image build would only lengthen it. The same base in both
+stages is what makes the runtime stage safe — the binary is linked against that
+glibc and libstdc++, and a smaller base from a different distribution could
+carry older versions of either and fail to start it.
+
+D31 asked for a single Dockerfile. The `.dockerignore` is not a second
+container artefact but a necessary companion: without it `COPY . .` would send
+every host build tree — sanitizer builds, a fetched GoogleTest checkout — into
+the build context, and a host artefact could be mistaken for one built inside
+the image.
+
+**Alternative considered.** Pinning apt package versions as well as the base
+image. Rejected: the Ubuntu archive removes superseded security versions, so
+pinned installs break without warning. The build is therefore reproducible in
+toolchain series — GCC 13, CMake 3.28 on Ubuntu 24.04 — rather than bit for bit,
+and the Dockerfile says so.
+
+**Validation.** Built with Docker 29.5.2 from both a path context and a tar stream; 125 tests
+passed inside the build stage each time. The runtime image runs as
+`uid=999(taskengine)`, contains no compiler, CMake, make or git, and links only
+libstdc++, libgcc_s, libc and libm. `docker image inspect` reports 29.8 MB; the
+layers added on top of the base are the 106 kB binary and a 41 kB user entry.
+`--help`, `--version` and a clean run exit 0, injected failures exit 1 with an
+exact count, and `--workers 0` exits 2. `docker stop` and
+`docker kill --signal=SIGINT` both produce an orderly stop with exit code 1,
+because the CLI installs its own handlers and so responds correctly as PID 1.
+
+One environment finding, recorded because it silently truncated the first
+validation run: `docker.exe` reached from WSL through Windows interop reads the
+calling shell's stdin. A script fed to `bash` on stdin loses everything after its
+first `docker.exe` call unless each call's stdin is redirected. The validation was
+re-run with every call reading `/dev/null`, and it is those results that are
+reported here.
+
+### Checkpoint C1, closed
+
+D27 kept `TaskEngine` at M5 and asked for one more look at the end of M6, if the
+CLI gave it no third responsibility. It did not: the CLI uses `submit`,
+`shutdown` and `summary` exactly as they were. But the CLI and the benchmark
+harness both drive the engine without ever naming a `TaskEnvelope`, which is the
+separation the class was kept to provide. Kept, and closed. No architectural
+question remains open.
+
+### Completion
+
+The roadmap ends at Milestone 8 (D30). Milestones 0 to 8 are complete. No further
+milestones were implemented or planned.

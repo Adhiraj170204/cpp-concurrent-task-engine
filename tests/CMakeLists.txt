@@ -26,8 +26,7 @@ FetchContent_MakeAvailable(googletest)
 
 # ---------------------------------------------------------------------------
 # Unit tests -- CTest label "unit" (ARCHITECTURE.md 10.1)
-# One test binary per label group; "concurrency" and "stress" arrive with the
-# code they test (ARCHITECTURE.md 0.1).
+# One test binary per label group: unit, concurrency, stress and integration.
 # ---------------------------------------------------------------------------
 add_executable(taskengine_unit_tests
     unit/blocking_queue_test.cpp
