@@ -1,0 +1,9 @@
+# Keep host build trees and repository metadata out of the image build context.
+# Without this, COPY . . would send every local build directory -- including a
+# fetched GoogleTest checkout and the sanitizer builds -- into the image build,
+# and a host artefact could be mistaken for one built inside the container.
+build/
+.git/
+.cache/
+.vscode/
+.idea/
