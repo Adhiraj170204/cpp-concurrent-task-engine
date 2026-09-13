@@ -9,6 +9,8 @@
 #include "taskengine/tasks/compute_task.hpp"
 #include "taskengine/version.hpp"
 
+#include <atomic>
+#include <csignal>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -33,6 +35,34 @@ using taskengine::RunSummary;
 using taskengine::Task;
 using taskengine::TaskEngine;
 using taskengine::TaskTimings;
+
+// Set from a signal handler and read by the submitting thread.
+//
+// std::atomic<bool> rather than volatile sig_atomic_t. The latter only has
+// defined behaviour between a handler and the thread it interrupted, but in a
+// multithreaded process the kernel may deliver SIGINT to any thread that does
+// not block it -- including a worker. The handler write and the main-thread read
+// would then be a data race. C++17 [support.signal] permits plain lock-free
+// atomic operations inside a signal handler, and an atomic is also safe across
+// threads, so this one type satisfies both requirements. The static_assert
+// makes the lock-free precondition a build failure rather than an assumption.
+std::atomic<bool> g_interrupted{false};
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "a signal handler may only use lock-free atomics");
+
+extern "C" void handle_interrupt(int /*signal*/) { g_interrupted.store(true); }
+
+// sigaction rather than std::signal: the handler is guaranteed to stay
+// installed, and the mask and flags are explicit rather than
+// implementation-defined.
+void install_interrupt_handlers() {
+    struct sigaction action {};
+    action.sa_handler = handle_interrupt;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    sigaction(SIGINT, &action, nullptr);
+    sigaction(SIGTERM, &action, nullptr);
+}
 
 // Fault injection for --fail-every.
 //
@@ -77,18 +107,28 @@ void print_stats_row(std::ostream& out, std::string_view label,
         << format_duration(stats.max) << std::setw(12) << format_duration(stats.mean()) << "\n";
 }
 
-void print_report(std::ostream& out, const Options& options, const RunSummary& summary,
-                  TaskTimings::Duration wall_time) {
+// Printed before the run starts, so the configuration is visible immediately
+// rather than only in retrospect if the run is long or is interrupted.
+void print_configuration(std::ostream& out, const Options& options) {
     out << "task-engine " << taskengine::version() << "\n\n";
-
     out << "configuration\n";
     out << "  workers          " << options.workers << "\n";
     out << "  tasks            " << options.tasks << "\n";
     out << "  work             " << options.work << "\n";
     out << "  queue capacity   " << options.queue_capacity << "\n";
     out << "  fail every       " << options.fail_every << "\n\n";
+    // Flushed on purpose: this is the point after which the process is busy,
+    // and anything watching the output needs to have seen it by now.
+    out << "running..." << std::endl;
+}
 
-    out << "outcome\n";
+void print_outcome(std::ostream& out, const RunSummary& summary, TaskTimings::Duration wall_time,
+                   std::size_t requested, bool interrupted) {
+    out << "\noutcome\n";
+    if (interrupted) {
+        out << "  interrupted      yes, after " << summary.total << " of " << requested
+            << " submissions\n";
+    }
     out << "  submitted        " << summary.total << "\n";
     out << "  succeeded        " << summary.succeeded << "\n";
     out << "  failed           " << summary.failed << "\n";
@@ -97,10 +137,9 @@ void print_report(std::ostream& out, const Options& options, const RunSummary& s
     if (summary.total_latency.count > 0) {
         // Header widths mirror print_stats_row exactly: a two-space indent, a
         // 14-wide label column, then five 12-wide value columns.
-        out << std::left << std::setw(16) << "  durations" << std::right
-            << std::setw(12) << "min" << std::setw(12) << "p50"
-            << std::setw(12) << "p95" << std::setw(12) << "max" << std::setw(12) << "mean"
-            << "\n";
+        out << std::left << std::setw(16) << "  durations" << std::right << std::setw(12) << "min"
+            << std::setw(12) << "p50" << std::setw(12) << "p95" << std::setw(12) << "max"
+            << std::setw(12) << "mean" << "\n";
         print_stats_row(out, "queue wait", summary.queue_wait);
         print_stats_row(out, "execution", summary.execution_time);
         print_stats_row(out, "latency", summary.total_latency);
@@ -120,12 +159,11 @@ void print_report(std::ostream& out, const Options& options, const RunSummary& s
     }
 
     out << "\nSingle run, no warm-up: these are what this invocation did, not a\n"
-           "benchmark. Repeatable measurement is a separate concern.\n";
+           "benchmark. Use bench-task-engine for repeatable measurement.\n";
 }
 
 std::unique_ptr<Task> make_task(const Options& options, std::size_t index) {
-    const bool inject_failure =
-        options.fail_every != 0 && ((index + 1) % options.fail_every) == 0;
+    const bool inject_failure = options.fail_every != 0 && ((index + 1) % options.fail_every) == 0;
     if (inject_failure) {
         return std::make_unique<FailingTask>();
     }
@@ -135,26 +173,50 @@ std::unique_ptr<Task> make_task(const Options& options, std::size_t index) {
 }
 
 int run(const Options& options) {
+    install_interrupt_handlers();
+
+    print_configuration(std::cout, options);
+
     TaskEngine engine{options.workers, options.queue_capacity};
 
     const TaskTimings::TimePoint start = TaskTimings::Clock::now();
 
-    for (std::size_t i = 0; i < options.tasks; ++i) {
+    std::size_t submitted = 0;
+    for (; submitted < options.tasks; ++submitted) {
+        if (g_interrupted.load()) {
+            break;
+        }
         // The future is discarded on purpose. Counts come from the run summary,
         // and a future backed by a promise -- unlike one from std::async -- does
         // not block when it is destroyed, so nothing is serialised by dropping
-        // it. This also keeps memory flat regardless of --tasks.
-        (void)engine.submit(make_task(options, i));
+        // it. Dropping it also avoids holding a promise shared state per task.
+        // Memory still grows with --tasks, by one 40-byte Sample per completed
+        // task, because exact percentiles need every sample (D10, D33).
+        (void)engine.submit(make_task(options, submitted));
     }
 
-    // Drain: everything accepted runs to completion before this returns.
-    engine.shutdown();
+    const bool interrupted = g_interrupted.load();
+    if (interrupted) {
+        // Abandon what is queued rather than finishing a batch the operator has
+        // asked to stop. Work already running still completes and still reports
+        // its real outcome: there is no safe way to interrupt a running task,
+        // and every abandoned task is reported as rejected rather than dropped.
+        engine.shutdown_now();
+    } else {
+        engine.shutdown();
+    }
 
     const TaskTimings::Duration wall_time = TaskTimings::Clock::now() - start;
     const RunSummary summary = engine.summary();
 
-    print_report(std::cout, options, summary, wall_time);
+    print_outcome(std::cout, summary, wall_time, options.tasks, interrupted);
 
+    if (interrupted) {
+        // The run did not do what was asked, so it is not a success even if
+        // every task that did run succeeded.
+        std::cerr << "task-engine: interrupted before submitting all tasks\n";
+        return taskengine::kExitTaskFailure;
+    }
     return taskengine::exit_code_for(summary.failed, summary.rejected);
 }
 
