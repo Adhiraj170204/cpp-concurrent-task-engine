@@ -145,3 +145,11 @@ if(TASKENGINE_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
+# ---------------------------------------------------------------------------
+# Benchmarks
+# The repeatable worker-scaling benchmark (ARCHITECTURE.md 8). Always built: it
+# depends on nothing beyond the library, and a harness that is only compiled when
+# someone remembers to ask for it tends to stop compiling.
+# ---------------------------------------------------------------------------
+add_subdirectory(benchmarks)
