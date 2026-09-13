@@ -1,480 +1,492 @@
-# task-engine
+# Concurrent Task Engine
 
-A concurrent task-processing engine in C++17: a bounded blocking queue, a fixed
-pool of worker threads, results delivered through `std::future`, two shutdown
-modes, per-task timing, a command-line driver, and a repeatable benchmark.
+A focused C++17 systems project: a bounded producer-consumer queue feeding a
+configurable pool of worker threads that execute polymorphic tasks. Every task
+comes back as a `std::future<TaskResult>` that is fulfilled exactly once, whether
+the task succeeds, throws, or is refused. The engine supports graceful (drain)
+and abort shutdown, records per-task timing, and ships with a command-line
+driver, a sanitizer-backed test suite of 133 tests, a repeatable benchmark
+harness, and a multi-stage Docker build.
 
-The project is a study of ownership, lifetime and concurrency correctness rather
-than a feature exercise. Every abstraction in it has to justify its own
-existence, every non-obvious choice is recorded with the alternative that was
-rejected, and every claim about performance comes from a run whose raw output is
-committed.
+## Why this project
 
-> **Status: complete.** Milestones 0 to 8 are done. The roadmap ended at
-> Milestone 8 by design ([D30](docs/DECISIONS.md)); there is no further planned
-> work.
+The engine is small on purpose. It exists to work through the problems that make
+concurrent C++ hard to get right, and to leave evidence for each answer:
+
+- **Ownership and lifetime** — who owns a task at every step from submission to
+  completion, and what guarantees that the queue outlives the threads using it.
+- **Concurrency** — a fixed set of workers, no thread per task, and results that
+  reach the caller no matter which path the task takes.
+- **Synchronization** — blocking waits without polling, and shutdown that
+  releases every blocked producer and consumer.
+- **Graceful shutdown** — finishing queued work, or abandoning it, without
+  interrupting running tasks or leaving a caller waiting forever.
+- **Performance measurement** — a benchmark with a fixed methodology, where the
+  numbers that did not match the design's predictions are reported alongside
+  the ones that did.
+
+## Features
+
+- **Bounded `BlockingQueue<T>`** with blocking push (backpressure), `pop()`
+  returning `std::optional<T>`, and a `close()` that releases every blocked
+  thread without discarding queued items.
+- **`ThreadPool`** with a configurable number of workers, created once and joined
+  on shutdown.
+- **Two shutdown modes**: `shutdown()` drains everything already queued;
+  `shutdown_now()` abandons queued work and reports each abandoned task as
+  rejected. The destructor drains and joins.
+- **`TaskEngine`** facade: `submit(std::unique_ptr<Task>)` returns
+  `std::future<TaskResult>`, with monotonically increasing task ids and a
+  summary of the run.
+- **Polymorphic tasks**: `ComputeTask` (deterministic CPU work) and `SleepTask`
+  (occupies a worker without using a core).
+- **Result propagation**: every result is `Succeeded`, `Failed` (with the
+  exception's message) or `Rejected`. A task that throws never takes down a
+  worker.
+- **Per-task timing** of queue wait, execution and total latency, with p50/p95 by
+  nearest rank.
+- **CLI** (`task-engine`) with input validation, documented exit codes, fault
+  injection, and graceful handling of SIGINT and SIGTERM.
+- **Benchmark harness** (`bench-task-engine`) with warm-up, repetitions and
+  environment capture.
+- **Sanitizer builds** (ASan + LSan + UBSan, TSan) selectable through one CMake
+  option.
+- **Multi-stage Dockerfile** that runs the tests during the image build.
 
 ## Architecture
 
-```
-    task-engine (CLI)                     bench-task-engine
-          |                                        |
-          v                                        v
-    +--------------------------------------------------------------+
-    |  TaskEngine      assigns ids, submits, summarises the run    |
-    +--------------------------------------------------------------+
-          |  submit(unique_ptr<Task>)  ->  future<TaskResult>
-          v
-    +--------------------------------------------------------------+
-    |  ThreadPool                                                  |
-    |    BlockingQueue<TaskEnvelope>   bounded; one mutex,         |
-    |                                  two condition variables     |
-    |    N worker threads              created once, joined once   |
-    |    per-worker Sample buffers     no lock on the record path  |
-    +--------------------------------------------------------------+
-          |  envelope.run() on a worker thread
-          v
-    +--------------------------------------------------------------+
-    |  Task: ComputeTask | SleepTask                               |
-    |  promise fulfilled exactly once: Succeeded, Failed, Rejected |
-    +--------------------------------------------------------------+
+```mermaid
+flowchart TD
+    CLI["CLI: task-engine"] --> Engine["TaskEngine<br/>assigns ids, returns futures"]
+    Engine --> Envelope["TaskEnvelope<br/>task + id + promise"]
+    Envelope --> Queue
+    subgraph Pool["ThreadPool"]
+        Queue["BlockingQueue<br/>bounded; one mutex, two condition variables"]
+        Queue --> Workers["Worker threads<br/>fixed count, created once"]
+    end
+    Workers --> Task["Task: virtual execute()"]
+    Task --> Compute["ComputeTask"]
+    Task --> Sleep["SleepTask"]
+    Compute --> Result["TaskResult through std::future<br/>plus per-worker timing samples"]
+    Sleep --> Result
 ```
 
-The invariants the code is built around, and tested against:
+**Ownership.** The caller hands over a `std::unique_ptr<Task>`. `TaskEngine` wraps
+it in a move-only `TaskEnvelope` together with its id, submission time and a
+`std::promise<TaskResult>`, and hands the matching `std::future` back to the
+caller. The envelope moves through the queue to exactly one worker, which runs
+the task and fulfils the promise. There are no raw owning pointers and no
+`shared_ptr` anywhere.
 
-- **Every future is fulfilled exactly once**, on every path — success, a thrown
-  exception, refusal after shutdown, work abandoned by an abort, and the pool
-  being destroyed underneath it. A caller blocked in `get()` is never left
-  waiting and never sees a broken promise.
-- **No thread per task.** Workers are created in the pool constructor and joined
-  on shutdown; nothing is left running afterwards.
-- **No polling in production code.** Every blocking wait is a condition variable
-  wait with a predicate.
-- **No raw owning pointers**, and no `shared_ptr`: ownership is `unique_ptr` and
-  values. The pool's member declaration order is load-bearing — the queue the
-  workers use is destroyed after the workers — and the header says so.
-- **No silent fallback.** A partially successful run is never reported as a
-  success, and every exit code means one thing.
+`TaskEngine` owns the `ThreadPool`, and the pool owns the queue, the per-worker
+timing buffers and the worker threads. The declaration order of those members is
+load-bearing: the threads are destroyed first, so the queue they use always
+outlives them.
 
-Two shutdown modes: `shutdown()` drains, running everything already queued;
-`shutdown_now()` abandons what is queued and reports each abandoned task as
-rejected. Neither interrupts a task that is already running.
+**Shutdown.** Shutdown always closes the queue before joining the workers. Drain
+mode lets the workers finish everything already queued. Abort mode removes the
+queued envelopes in the same locked step as the close, and fulfils each one as
+`Rejected`. Neither mode interrupts a task that is already running. In every
+case — success, a thrown exception, submission after shutdown, abandoned work,
+or the engine being destroyed — each future resolves exactly once.
 
-The full design — module graph, ownership, thread model, lifecycle, error
-propagation, benchmarking and testing strategy — is in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Thirty-four decisions, each with
-its reason, the alternative considered and the trade-off, are in
-[`docs/DECISIONS.md`](docs/DECISIONS.md).
+The full design is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Requirements
+## Key C++ concepts demonstrated
 
-Linux. Developed and tested on WSL2 Ubuntu 24.04 (D14). The tests read
-`/proc/self/task` and use POSIX signals and process APIs.
+- **RAII** — the pool's destructor drains and joins, locks are scoped with
+  `std::lock_guard` and `std::unique_lock`, and member declaration order
+  guarantees the queue outlives the workers.
+- **Rule of zero and explicit ownership** — `TaskEnvelope` and `TaskResult`
+  declare no copy or move operations of their own; they are move-only or
+  copyable because their members are. `TaskResult` is built only through named
+  factories, so invalid combinations cannot be constructed.
+- **`std::unique_ptr`** — task ownership transfers from caller to engine to queue
+  to worker with no copies and no shared ownership.
+- **Move semantics** — `BlockingQueue::push` takes `T&&`, so an element cannot be
+  copied by accident, and `pop()` emplaces into `std::optional` so elements need
+  no default constructor. Tests confirm elements are moved, never copied.
+- **Virtual dispatch** — `Task::execute()` is the one virtual call. The base class
+  has a virtual destructor defined out of line, and protected copy and move
+  operations so objects cannot be sliced through a base-class reference.
+- **`std::mutex` and `std::condition_variable`** — one mutex guards the queue;
+  producers and consumers wait on separate condition variables using predicate
+  waits, and notifications are sent after the lock is released.
+- **Futures and promises** — each envelope's promise is fulfilled exactly once,
+  and a refused submission is fulfilled as `Rejected` rather than left as a
+  broken promise.
+- **Atomics where they are justified** — the task-id counter, the rejection
+  counter, and the signal flag, a `std::atomic<bool>` whose lock-free property is
+  checked at compile time because it is written from a signal handler.
+- **Exceptions across a worker boundary** — the code that runs a task is
+  `noexcept` and catches `std::exception` and `...`, so a throwing task becomes a
+  `Failed` result instead of an escaped exception calling `std::terminate`.
+- **C++17** — `std::optional`, `std::string_view`, `std::from_chars`,
+  `[[nodiscard]]` and `inline constexpr`, compiled as strict `-std=c++17` with
+  GNU extensions off.
+- **CMake** — target-scoped warnings with `-Werror`, a sanitizer build option,
+  GoogleTest pinned to a commit through `FetchContent`, and CTest labels for each
+  test suite.
 
-| Tool | Minimum | Verified with |
-|---|---|---|
-| C++ compiler | C++17 | GCC 13.3.0 |
-| CMake | 3.22 | 3.28.3 |
-| Make | — | GNU Make 4.3 |
-| Git | — | 2.43.0 |
+## Build
+
+Linux is required. The project was developed and tested on Ubuntu 24.04 under
+WSL2 with GCC 13.3.0 and CMake 3.28.3; CMake 3.22 is the minimum.
 
 ```bash
 sudo apt install build-essential cmake git
 ```
 
-CMake 3.22 is the floor for a specific reason: below it, policy CMP0128 is OLD
-and `CXX_EXTENSIONS OFF` is silently ignored whenever the compiler's default
-standard already satisfies the request, so the build would compile as `gnu++17`
-while claiming strict C++17 (D17).
-
-## Build
+Release:
 
 ```bash
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
 cmake --build build/release -j"$(nproc)"
+```
 
+Debug:
+
+```bash
 cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/debug -j"$(nproc)"
 ```
 
-Build trees live under `build/` and are gitignored. Release is pinned to
-`-O2 -DNDEBUG` (D16) and is the only configuration the benchmark will measure.
-All of our own code compiles with
-`-Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor -Werror`; third-party code
-does not inherit that policy.
+The build produces `task-engine`, `benchmarks/bench-task-engine` and the test
+binaries. Release is pinned to `-O2 -DNDEBUG`. GoogleTest is downloaded at
+configure time, so the first configure needs network access; add
+`-DTASKENGINE_BUILD_TESTS=OFF` to build without the tests.
 
-The build produces `task-engine`, `benchmarks/bench-task-engine`, and one test
-binary per suite.
+## Run
 
-## Test
+A successful run:
 
-```bash
-ctest --test-dir build/debug --output-on-failure
-```
-
-Each `TEST()` is its own CTest entry, so a failure names the case. Suites carry
-labels:
-
-```bash
-ctest --test-dir build/debug -L unit          # fast, no threads
-ctest --test-dir build/debug -L concurrency  # threaded behaviour
-ctest --test-dir build/debug -L stress       # high volume, shutdown under load
-ctest --test-dir build/debug -L integration  # the real binaries: exit codes, signals
-```
-
-GoogleTest is fetched at configure time, so the first configure needs network
-access. `-DTASKENGINE_BUILD_TESTS=OFF` builds without it.
-
-No test coordinates threads with a sleep. Two bounded waits on a predicate
-remain, each because no correct alternative exists, and both are explained in
-the code and in D33.
-
-## Sanitizers
-
-`TASKENGINE_SANITIZER` selects `off` (default), `address+undefined`, or
-`thread`. AddressSanitizer and ThreadSanitizer cannot share a binary, so each
-gets its own build tree.
-
-```bash
-# AddressSanitizer + LeakSanitizer + UndefinedBehaviorSanitizer
-cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug -DTASKENGINE_SANITIZER=address+undefined
-cmake --build build/asan -j"$(nproc)"
-ctest --test-dir build/asan --output-on-failure
-
-# ThreadSanitizer
-cmake -S . -B build/tsan -DCMAKE_BUILD_TYPE=Debug -DTASKENGINE_SANITIZER=thread
-setarch "$(uname -m)" -R cmake --build build/tsan -j"$(nproc)"
-TSAN_OPTIONS=halt_on_error=1 setarch "$(uname -m)" -R \
-    ctest --test-dir build/tsan --output-on-failure
-
-# shake out interleavings rather than sampling one
-TSAN_OPTIONS=halt_on_error=1 setarch "$(uname -m)" -R \
-    ctest --test-dir build/tsan -L concurrency --repeat until-fail:25
-```
-
-`setarch -R` is needed for ThreadSanitizer on current kernels, WSL2 included:
-TSan maps shadow memory at fixed addresses and aborts with
-`unexpected memory mapping` under the modern ASLR default of
-`vm.mmap_rnd_bits = 32`. Lowering that sysctl needs root; `setarch -R` disables
-randomisation for one process tree and does not. It wraps the build too, because
-`gtest_discover_tests` runs each test binary at build time.
-
-## Usage
-
-```bash
-./build/release/task-engine --workers 8 --tasks 10000 --work 500
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--workers N` | hardware concurrency | worker threads |
-| `--tasks N` | 1000 | tasks to submit |
-| `--work N` | 1000 | compute iterations per task; `0` submits empty tasks |
-| `--queue-capacity N` | 1024 | bounded queue capacity |
-| `--fail-every N` | 0 (never) | make every Nth task throw — fault injection |
-| `-h`, `--help` | | print help and exit |
-| `--version` | | print the version and exit |
-
-`--help` carries the same table and the exit codes.
-
-### Exit codes
-
-| Code | Meaning |
-|---|---|
-| `0` | every task succeeded |
-| `1` | the run completed but at least one task failed or was rejected, or the run was interrupted |
-| `2` | invalid usage or configuration |
-
-Results go to stdout and diagnostics to stderr, so a caller redirecting stdout
-still learns why nothing came out of it.
-
-### Interrupting a run
-
-SIGINT and SIGTERM stop a run gracefully: submission stops, queued work is
-abandoned and counted as rejected, tasks already running finish, the report is
-printed with the interruption stated, and the exit code is 1. `docker stop`
-behaves the same way.
-
-### Examples
-
-```bash
-task-engine --workers 8 --tasks 5000 --work 2000        # exit 0
-task-engine --tasks 100 --work 100 --fail-every 10       # exit 1, 10 failed
-task-engine --workers 1 --tasks 20000 --work 0           # exit 0, engine overhead only
-task-engine --workers 0                                  # exit 2
-```
-
-Output of the first example:
-
-```
+```console
+$ ./build/release/task-engine --workers 4 --tasks 10000 --work 500
 task-engine 0.1.0
 
 configuration
-  workers          8
-  tasks            5000
-  work             2000
+  workers          4
+  tasks            10000
+  work             500
   queue capacity   1024
   fail every       0
 
 running...
 
 outcome
-  submitted        5000
-  succeeded        5000
+  submitted        10000
+  succeeded        10000
   failed           0
   rejected         0
 
   durations              min         p50         p95         max        mean
-  queue wait        239.00ns      6.02us    160.18us    217.52us     24.00us
-  execution           1.34us      1.45us      2.65us     65.19us      1.65us
-  latency             1.65us      7.56us    162.12us    220.12us     25.65us
+  queue wait        282.00ns      6.54us    258.71us    488.75us     35.36us
+  execution         380.00ns    467.00ns    717.00ns     24.90us    506.00ns
+  latency           736.00ns      7.03us    259.13us    490.77us     35.87us
 
-wall time          53.35ms
-throughput         93716 tasks/s
+wall time          140.89ms
+throughput         70976 tasks/s
 
 Single run, no warm-up: these are what this invocation did, not a
 benchmark. Use bench-task-engine for repeatable measurement.
 ```
 
-The wall time and throughput are real measurements of that one invocation, and
-the output says so. They are not benchmark results; see below.
+Failure injection — every 10th task throws, and the run exits with code 1:
 
-## Benchmarks
+```console
+$ ./build/release/task-engine --workers 4 --tasks 100 --work 100 --fail-every 10
+...
+outcome
+  submitted        100
+  succeeded        90
+  failed           10
+  rejected         0
+...
+$ echo $?
+1
+```
+
+Help and version:
+
+```console
+$ ./build/release/task-engine --help
+task-engine - concurrent task processing engine
+
+Usage:
+  task-engine [options]
+
+Options:
+  --workers N          worker threads (default: hardware concurrency)
+  --tasks N            tasks to submit (default: 1000)
+  --work N             compute iterations per task (default: 1000)
+                       0 submits empty tasks, measuring engine overhead
+  --queue-capacity N   bounded queue capacity (default: 1024)
+  --fail-every N       make every Nth task throw (default: 0, never)
+                       fault injection, for exercising the failure path
+  -h, --help           print this help and exit
+      --version        print the version and exit
+
+Exit codes:
+  0  every task succeeded
+  1  the run completed, but at least one task failed or was rejected
+  2  invalid usage or configuration
+
+Examples:
+  task-engine --workers 8 --tasks 10000 --work 500
+  task-engine --workers 1 --tasks 100 --work 0
+  task-engine --tasks 100 --fail-every 10
+
+$ ./build/release/task-engine --version
+task-engine 0.1.0
+```
+
+Option values are separated by a space (`--workers 8`). Results go to stdout and
+diagnostics to stderr. SIGINT or SIGTERM stops a run gracefully: submission
+stops, queued work is abandoned and counted as rejected, running tasks finish,
+the report states that the run was interrupted, and the exit code is 1.
+
+## Testing
+
+**133 tests** in four CTest suites: 80 unit, 33 concurrency, 8 stress and 12
+integration. Every `TEST()` is registered individually, so a failure names the
+exact case.
+
+```bash
+ctest --test-dir build/debug --output-on-failure
+ctest --test-dir build/release --output-on-failure
+
+ctest --test-dir build/debug -L unit          # no threads
+ctest --test-dir build/debug -L concurrency  # queue, pool and engine under concurrent use
+ctest --test-dir build/debug -L stress       # high volume, abort under load, repeated create/destroy
+ctest --test-dir build/debug -L integration  # the real binaries: exit codes, stdout/stderr, signals
+```
+
+The concurrency and stress suites check the engine's invariants directly: every
+item delivered exactly once, every future resolved with no broken promise,
+blocked threads released on shutdown, and no worker threads left behind. The
+integration suite runs `task-engine` in a child process and sends it SIGINT and
+SIGTERM. No test coordinates threads with a sleep; the two bounded waits that
+remain are explained in the code and in
+[`docs/DECISIONS.md`](docs/DECISIONS.md) (D33).
+
+**AddressSanitizer + LeakSanitizer + UndefinedBehaviorSanitizer:**
+
+```bash
+cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug -DTASKENGINE_SANITIZER=address+undefined
+cmake --build build/asan -j"$(nproc)"
+ctest --test-dir build/asan --output-on-failure
+```
+
+**ThreadSanitizer:**
+
+```bash
+cmake -S . -B build/tsan -DCMAKE_BUILD_TYPE=Debug -DTASKENGINE_SANITIZER=thread
+setarch "$(uname -m)" -R cmake --build build/tsan -j"$(nproc)"
+TSAN_OPTIONS=halt_on_error=1 setarch "$(uname -m)" -R \
+    ctest --test-dir build/tsan --output-on-failure
+
+# repeat to exercise more interleavings
+TSAN_OPTIONS=halt_on_error=1 setarch "$(uname -m)" -R \
+    ctest --test-dir build/tsan -L concurrency --repeat until-fail:25
+```
+
+`setarch -R` disables address-space randomisation for that process tree. Current
+kernels, WSL2 included, use more ASLR entropy than TSan's fixed shadow-memory
+layout allows, and TSan aborts at startup without it.
+
+All 133 tests pass in Debug and Release from a clean clone with zero compiler
+warnings. The test suite, repeated runs of the concurrency, stress and
+integration suites, and the benchmark harness have all run clean under both
+sanitizer builds. Before its results were trusted, ThreadSanitizer was checked
+against a deliberately planted data race built with the same flags, so a clean
+TSan run is evidence rather than silence.
+
+## Benchmarking
 
 ```bash
 ./build/release/benchmarks/bench-task-engine > results.csv
 ```
 
-A fixed experiment rather than a configurable tool (D34), so anyone running it
-measures the same thing:
+The harness is a fixed experiment, so every run measures the same thing:
 
-- **Profiles.** `overhead-floor`: empty tasks on one worker, the engine's
-  per-task cost. `cpu-heavy`: tasks doing real work, where parallelism should
-  help. `lightweight`: tasks so small that the engine's own synchronisation
-  dominates. `blocking`: tasks that sleep, occupying a worker without a core.
-- **Worker counts** 1, 2, 4, 8, 12 and 16.
-- **Protocol.** One discarded warm-up, then five measured repetitions per
-  configuration; median, minimum and maximum reported.
-- **Setup versus steady state.** Task objects are built, and the engine and its
-  threads created, before the clock starts. The timed region is from the first
-  submit to the return of drain shutdown. Submission time is recorded separately
-  inside it, so a run limited by the single submitting thread is visible as such.
-- **Percentiles** by nearest rank, the same definition the engine uses.
-- **Output** is CSV, with the machine, kernel, compiler, flags and time recorded
-  in `#` comment lines.
-
-The harness refuses to measure a Debug or sanitizer build. `--smoke` runs a tiny
-version of the matrix in any build to prove the harness works; it is part of the
-integration suite and is not a measurement.
+- **Workload profiles**: `cpu-heavy` (4,000 tasks of 200,000 iterations),
+  `lightweight` (200,000 tasks of 200 iterations), `blocking` (400 tasks that
+  each sleep 2 ms), plus an `overhead-floor` of empty tasks on one worker.
+- **Worker counts**: 1, 2, 4, 8, 12 and 16.
+- **Protocol**: one discarded warm-up run, then 5 measured repetitions per
+  configuration, reporting the median, minimum and maximum.
+- **Setup excluded**: tasks are constructed and worker threads started before the
+  clock starts. The timed region runs from the first submission until drain
+  shutdown returns, with submission time recorded separately.
+- **Environment captured** in the CSV: CPU model, logical CPU count, kernel, OS,
+  compiler, build type, flags, sanitizer mode and timestamp.
+- **Measurement builds only**: the harness refuses to measure Debug or sanitizer
+  builds. A `--smoke` mode runs a tiny matrix in any build to check that the
+  harness works, and is part of the integration suite.
 
 ### Results
 
-| | |
-|---|---|
-| CPU | 12th Gen Intel Core i5-12450H, 12 logical CPUs |
-| Kernel | 6.6.87.2-microsoft-standard-WSL2 |
-| OS | Ubuntu 24.04.4 LTS, under WSL2 |
-| Compiler | GCC 13.3.0, Release, `-O2 -DNDEBUG`, no sanitizer |
-| Queue capacity | 1024 |
-| Submitting threads | 1 |
-| Recorded | 2026-09-13T02:02:20Z; load average 0.44 before, 0.90 after; 94 s |
+Throughput in tasks per second, median of 5 repetitions:
 
-The harness records the CPU model and logical CPU count. That this part is a
-hybrid design — four performance cores with Hyper-Threading and four efficiency
-cores — comes from the processor's published specification, not from anything
-the harness measured, and matters to the interpretation below. WSL2 is a virtual
-machine: these figures compare worker counts on one machine and are not
-bare-metal numbers.
+| Workers | CPU-heavy | Lightweight | Blocking |
+|---:|---:|---:|---:|
+| 1 | 6,549 | 1,042,422 | 451 |
+| 4 | 21,617 | 66,772 | 1,812 |
+| 8 | 30,475 | 77,373 | 3,703 |
+| 16 | 33,432 | 89,753 | 7,358 |
 
-**Overhead floor** — empty tasks, one worker: **1,321,017 tasks/s** median
-(1,296,516 – 1,354,052), about **757 ns per task** end to end through submit,
-queue, dequeue, promise fulfilment and sample recording. Execution itself is
-20 ns at the median; submission accounts for 151.1 ms of the 151.4 ms wall time.
+> These are measurements from one laptop — a 12th Gen Intel Core i5-12450H with
+> 12 logical CPUs, running Ubuntu 24.04.4 under WSL2 — with GCC 13.3.0 in Release
+> at `-O2`, one submitting thread and a queue capacity of 1024. WSL2 is a virtual
+> machine, so the numbers compare worker counts on that machine; they are not
+> bare-metal figures or performance guarantees.
 
-**cpu-heavy** — 4,000 tasks of 200,000 iterations each:
+A second full run agreed within 4% for most configurations. The largest
+difference was 12.7%, at 16 workers on the CPU-heavy profile, and the two runs
+disagreed on whether 12 or 16 workers was faster there, so no ordering between
+them is claimed. Both runs, with every latency column and the 2- and 12-worker
+rows, are in [`benchmarks/results/`](benchmarks/results/).
 
-| Workers | Tasks/s (median) | Min – max | Speedup | Execution p50 | Queue wait p50 |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 6,549 | 6,508 – 6,621 | 1.00× | 142 µs | 155.7 ms |
-| 2 | 12,637 | 12,245 – 12,985 | 1.93× | 145 µs | 79.7 ms |
-| 4 | 21,617 | 20,967 – 21,973 | 3.30× | 161 µs | 47.0 ms |
-| 8 | 30,475 | 29,933 – 30,701 | 4.65× | 287 µs | 33.4 ms |
-| 12 | 37,907 | 37,074 – 38,052 | 5.79× | 301 µs | 26.6 ms |
-| 16 | 33,432 | 31,656 – 37,247 | 5.11× | 302 µs | 26.8 ms |
+**What the numbers show:**
 
-**lightweight** — 200,000 tasks of 200 iterations each:
+- **CPU-heavy scaling saturates.** Throughput reached 3.30× at 4 workers but only
+  4.65× at 8 and 5.11× at 16. Each task does identical, deterministic work, yet
+  its measured execution time roughly doubled — from about 142 µs to about
+  300 µs — once 8 or more workers were running. That is consistent with threads
+  landing on Hyper-Threading siblings and on this hybrid CPU's efficiency cores;
+  threads are not pinned, so the benchmark does not separate those effects.
+- **Blocking work scales with workers, not cores.** A sleeping worker does not use
+  a CPU, so 16 workers delivered 16.3× the single-worker throughput on 12 logical
+  CPUs.
+- **Lightweight work exposes synchronization overhead.** Going from 1 to 4 workers
+  made throughput about 15× *slower*. Voluntary context switches rose from 0.08
+  to 1.21 per task over the same change: several workers empty the queue faster
+  than one thread can fill it, so nearly every push has to wake a blocked worker.
+  The engine's single mutex and per-push notification cost nothing measurable
+  for 142 µs tasks, and dominate for 0.2 µs ones.
 
-| Workers | Tasks/s (median) | Min – max | Speedup | Execution p50 | Queue wait p50 |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 1,042,422 | 1,017,416 – 1,064,793 | 1.00× | 0.17 µs | 957 µs |
-| 2 | 165,507 | 151,971 – 175,885 | 0.16× | 0.20 µs | 36 µs |
-| 4 | 66,772 | 65,141 – 69,506 | 0.06× | 0.24 µs | 6.4 µs |
-| 8 | 77,373 | 74,599 – 82,751 | 0.07× | 0.26 µs | 7.2 µs |
-| 12 | 87,650 | 83,312 – 90,434 | 0.08× | 0.26 µs | 7.2 µs |
-| 16 | 89,753 | 87,935 – 90,683 | 0.09× | 0.26 µs | 7.5 µs |
-
-**blocking** — 400 tasks that each sleep 2 ms:
-
-| Workers | Tasks/s (median) | Min – max | Speedup | Execution p50 | Queue wait p50 |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 451 | 448 – 454 | 1.00× | 2.20 ms | 441 ms |
-| 2 | 908 | 905 – 940 | 2.01× | 2.17 ms | 218 ms |
-| 4 | 1,812 | 1,796 – 1,837 | 4.01× | 2.17 ms | 106 ms |
-| 8 | 3,703 | 3,595 – 3,717 | 8.20× | 2.12 ms | 52.3 ms |
-| 12 | 5,460 | 5,329 – 5,580 | 12.10× | 2.12 ms | 34.0 ms |
-| 16 | 7,358 | 7,293 – 7,446 | 16.30× | 2.13 ms | 25.5 ms |
-
-Every configuration completed with zero failed and zero rejected tasks.
-
-The complete CSV for this run, including every latency column, is
-[`benchmarks/results/2026-09-13-wsl2-i5-12450h.csv`](benchmarks/results/2026-09-13-wsl2-i5-12450h.csv).
-
-### What the numbers show
-
-Three different regimes, and one of them is the reason the benchmark exists.
-
-**Blocking tasks scale with workers, not cores.** Throughput rose 16.3× at 16
-workers on 12 logical CPUs (16.7× in the second run). A sleeping worker holds no
-core, so workers beyond the core count still help — which is why the pool size
-is configurable at all. The slight superlinearity is measured rather than
-mysterious: each 2 ms sleep overran by less when more threads were busy, with
-execution p50 falling from 2.20 ms at one worker to 2.13 ms at sixteen, and
-16 × (2.20 / 2.13) ≈ 16.6 accounts for most of it.
-
-**CPU-heavy tasks scale until the cores run out, and sooner than the core count
-suggests.** Two workers gave 1.86–1.93×, four gave 3.30×, eight 4.7–4.8×, and
-twelve or sixteen between 5.1× and 5.8×. The work in every task is identical and
-deterministic, yet its measured execution time roughly doubled — from 142–146 µs
-with one or two workers to 283–302 µs with eight or more. The same work taking
-twice as long means each thread was getting about half a core's worth of
-throughput. That is consistent with this CPU's layout of four performance cores
-with Hyper-Threading plus four efficiency cores, where the fifth thread onward
-lands on a sibling or a slower core. The harness does not pin threads, so it
-cannot separate those two effects from each other or from the WSL2 scheduler.
-The queue was not the limit: queue wait fell steadily as workers were added, and
-at one worker it was close to what a full 1024-task queue draining at 142 µs a
-task implies — about 145 ms, against 156 ms measured.
-
-**Lightweight tasks got about 15× slower when workers were added.** One worker
-handled about a million tasks a second. Two handled 162–166 thousand; four about
-67 thousand. The tasks themselves ran in 0.17–0.27 µs throughout, and submission
-accounted for more than 99.7% of wall time in every configuration, so the cost is
-in handing tasks over, not in running them.
-
-Context-switch counts show where it goes. With one worker the process made
-**0.08 voluntary context switches per task**: the queue stayed full, the worker
-never had to wait, and in glibc a condition-variable notification with no waiter
-costs no system call. With four workers it made **1.21 per task** — fifteen times
-as many, matching the fifteen-fold slowdown. Several workers drain the queue
-faster than one thread can fill it, so they sit blocked on the condition
-variable, queue wait drops to 6–8 µs, and nearly every submission has to wake a
-worker with a system call and a context switch. Each task then costs about 15 µs
-end to end, against under 1 µs with a single worker, for work that takes 0.2 µs.
-
-**What this says about the design.** ARCHITECTURE.md predicted that lightweight
-throughput would rise and then fall, with the queue mutex as the bottleneck. It
-did not rise at all, and the evidence points at wake-ups rather than at time spent
-holding the lock (D34). One mutex and a notification on every push is simple and
-correct, costs nothing measurable when tasks are large, and pays for that
-simplicity when they are tiny. The two task sizes bracket the crossover rather
-than locate it: at 0.2 µs a second worker cost more than 6×, and at 142 µs it
-gained 1.86–1.93×. For work that small, fewer workers is faster.
-
-**How far to trust these figures.** A second, independent full run agreed within
-4% for most configurations. The exceptions were the overhead floor at 6.9% and
-the configurations at 12 or 16 workers, where the largest difference was 12.7%,
-on the CPU-heavy profile at 16 workers. The first run put 12 workers ahead of 16
-on that profile and the second put 16 ahead of 12, so no ordering between them is
-claimed. The second run is in
-[`benchmarks/results/2026-09-13-wsl2-i5-12450h-run2.csv`](benchmarks/results/2026-09-13-wsl2-i5-12450h-run2.csv).
-Context-switch counts come from GNU `time -v` around the CLI with the same task
-sizes, three runs per worker count, and are recorded in D34.
+The detailed analysis, including the overhead floor of about 0.8 µs per task and
+where the design's predictions were wrong, is in
+[`docs/DECISIONS.md`](docs/DECISIONS.md) (D34).
 
 ## Docker
-
-A multi-stage build of the CLI (D31, D34):
 
 ```bash
 docker build -t task-engine .
 docker run --rm task-engine --workers 4 --tasks 10000 --work 500
+docker run --rm task-engine --version
 docker run --rm task-engine            # no arguments: prints --help
 ```
 
-- **Build stage.** Ubuntu 24.04 pinned by digest, the toolchain, a Release build,
-  and the unit, concurrency and integration suites run inside the build. An image
-  is only produced if those 125 tests pass inside it.
-- **Runtime stage.** The same pinned base, the one binary, and an unprivileged
-  system user (`uid=999`). No compiler, CMake, make or git; `ldd` shows only
-  libstdc++, libgcc, libc and libm. `docker image inspect` reports 29.8 MB, of
-  which the layers added on top of the base are the 106 kB binary and a 41 kB
-  user entry.
-- **Signals.** `docker stop` sends SIGTERM to PID 1; because the CLI installs its
-  own handlers it stops gracefully, prints its report and exits 1.
-- **Reproducibility.** The base image is pinned by digest; the apt packages on top
-  resolve against the Ubuntu 24.04 archive at build time, so the build is
-  reproducible in toolchain series rather than bit for bit.
-- **Not a measurement environment.** Benchmark figures come from a Release build
-  on the host, never from inside the container.
+- **Multi-stage build.** The build stage installs the toolchain and compiles a
+  Release build; the runtime stage copies in only the binary.
+- **Pinned base.** Both stages use `ubuntu:24.04` pinned by digest, so the binary
+  runs on the same glibc and libstdc++ it was built against.
+- **Tests during the build.** The unit, concurrency and integration suites (125
+  tests) run inside the build stage, so an image is only produced if they pass.
+  Stress tests are left to the host sanitizer runs.
+- **Non-root runtime.** The container runs as a dedicated system user
+  (`uid=999`), with no compiler, CMake, make or git in the image.
+- **Signals.** `docker stop` sends SIGTERM, which the CLI handles gracefully:
+  it prints its report and exits with code 1.
+- **Reproducibility.** The base image is pinned; the apt packages installed on top
+  are not, so builds are reproducible in toolchain version rather than bit for
+  bit.
 
-Validated with Docker 29.5.2, building from both a path context and a tar stream.
+The container reproduces the build and runs the CLI. Benchmark numbers are never
+taken inside it.
 
-## Limitations and deliberate non-goals
-
-Known limitations, each measured or stated rather than hidden:
-
-- **Memory grows with run size.** Exact nearest-rank percentiles require keeping
-  every sample, at 40 bytes per completed task. Observed directly: resident
-  memory rose from 3.6 MB to 19.1 MB while about 460 thousand tasks completed.
-  On an 8 GB machine that bounds a single run at roughly 10^8 tasks (D33).
-- **One submitting thread** in both the CLI and the benchmark, so throughput can
-  be limited by submission before it is limited by the workers. The benchmark
-  measures this rather than assuming it away.
-- **Running tasks are never interrupted.** Shutdown waits for them; there is no
-  portable, safe way to stop a running thread. There is no per-task
-  cancellation.
-- **Interruption is noticed between submissions.** A submitter blocked on a full
-  queue notices a signal only once a worker frees a slot.
-- **A task must not submit to, or shut down, the engine running it.** Submission
-  can deadlock against a full queue only that worker could drain; shutdown would
-  have the worker join itself. Documented as unsupported rather than defended
-  against (D5, D26).
-- **Benchmark figures are from a laptop under WSL2**: valid for comparison across
-  worker counts on that machine, not bare-metal numbers.
-- **Linux only.** The tests use `/proc`, POSIX signals and process APIs.
-- **The container build is reproducible in toolchain series**, not bit for bit:
-  the base image is pinned by digest, the apt packages installed on it are not.
-- **The CLI accepts space-separated values only**; `--workers=8` is not
-  recognised.
-
-Deliberately out of scope, and removed from the roadmap rather than deferred
-([D30](docs/DECISIONS.md)): an HTTP service, a message-broker adapter, a data
-store, cloud or cluster deployment, distributed scheduling, and GPU execution.
-
-## Layout
+## Project structure
 
 ```
-CMakeLists.txt                project, C++17, warning and sanitizer policy, targets
-Dockerfile, .dockerignore     multi-stage container build (D31, D34)
 include/taskengine/
-  core/                       Task, TaskResult, TaskEnvelope, Sample, state and ids
-  concurrency/                BlockingQueue, ThreadPool
-  execution/                  TaskEngine
-  metrics/                    run summary and nearest-rank percentiles
-  tasks/                      ComputeTask, SleepTask
-  cli/                        argument parsing, validation, exit codes
-src/                          library sources; src/app/main.cpp is the CLI
-tests/unit/                   no threads             (label: unit)
-tests/concurrency/            threaded behaviour     (label: concurrency)
-tests/stress/                 volume, abort under load (label: stress)
-tests/integration/            real binaries in child processes (label: integration)
-tests/support/                gates, barrier, thread observation
-benchmarks/                   bench-task-engine and committed results
-docs/                         ARCHITECTURE.md, DECISIONS.md
-PLAN.md, CLAUDE.md            roadmap and development rules
+  core/          Task, TaskResult, TaskEnvelope, task state and ids
+  concurrency/   BlockingQueue, ThreadPool
+  execution/     TaskEngine
+  metrics/       run summary and nearest-rank percentiles
+  tasks/         ComputeTask, SleepTask
+  cli/           argument parsing, validation, exit codes
+src/             library implementation; src/app/main.cpp is the CLI
+tests/
+  unit/  concurrency/  stress/  integration/  support/
+benchmarks/      bench-task-engine and the committed result CSVs
+docs/            ARCHITECTURE.md, DECISIONS.md
+Dockerfile       multi-stage container build
 ```
 
-## Dependencies
+## Design decisions
 
-GoogleTest, pinned to a commit and used in test builds only (D15). The library,
-the CLI and the benchmark link nothing outside the C++ standard library and
-POSIX.
+Every non-obvious choice is recorded with its reason, the alternative that was
+considered and the trade-off — 34 decisions in
+[`docs/DECISIONS.md`](docs/DECISIONS.md). The most important ones:
+
+- **Bounded queue with blocking push.** Backpressure instead of unbounded memory
+  growth; it also makes queue-wait measurements meaningful. (D5)
+- **Futures, with refusals delivered as results.** A refused or abandoned task
+  resolves as `Rejected` instead of leaving the caller with a broken promise.
+  (D3, D25)
+- **Task failures are results, not exceptions.** A throwing task produces a
+  `Failed` result with its message, so failures can be counted. (D4)
+- **Two explicit shutdown modes**, and member declaration order treated as a
+  correctness requirement. (D6, D26)
+- **A polymorphic `Task` kept only on evidence** — the two task types differ in
+  kind, not just by a parameter. (D1, D28)
+- **Per-worker timing buffers**, so recording measurements adds no contention
+  between workers. (D10)
+- **Strict C++17 enforced by the build**, with a CMake minimum chosen for a
+  documented correctness reason. (D17)
+- **A deliberately narrow scope**, ending at a CLI, tests, benchmarks and a
+  container. (D30)
+
+## Limitations
+
+These are deliberate scope decisions, documented rather than hidden:
+
+- **Single process, single machine.** There is no distributed execution or
+  distributed scheduling.
+- **No per-task cancellation.** Running tasks are never interrupted: shutdown
+  waits for them. A signal is noticed between submissions, so a submitter blocked
+  on a full queue sees it once a worker frees a slot.
+- **No service integrations.** There is no HTTP API, FastAPI service, RabbitMQ or
+  other message broker, database or cloud deployment; these were removed from
+  scope rather than deferred.
+- **No re-entrant use from inside a task.** A task must not submit work to, or
+  shut down, the engine running it: submitting can deadlock against a full queue
+  that only that worker could drain, and shutting down would make a worker wait
+  for itself.
+- **Benchmark numbers are environment-specific.** They come from one WSL2 laptop
+  with a hybrid CPU and unpinned threads, and compare worker counts on that
+  machine only.
+- **Memory grows with run size.** Exact percentiles keep every sample, about 40
+  bytes per completed task, which puts one run on an 8 GB machine at roughly 10^8
+  tasks.
+- **One submitting thread** in the CLI and the benchmark, so very small tasks are
+  limited by hand-off and wake-up cost rather than by the workers.
+- **Linux only.** The tests rely on `/proc`, POSIX signals and process APIs.
+- **The CLI accepts space-separated option values only**; `--workers=8` is
+  rejected.
+
+## What I learned / engineering focus
+
+- **Making invariants testable.** "Every future is fulfilled exactly once" is
+  checked on every shutdown path, under load, and after the engine is destroyed.
+- **Treating sanitizers as evidence.** Tests create interleavings and
+  ThreadSanitizer judges them, and the sanitizer was itself checked against a
+  known race.
+- **Removing timing from tests.** Several tests that only passed because of
+  scheduling were rewritten to be deterministic, including one that raced the
+  kernel's removal of exited threads from `/proc`.
+- **Measuring before explaining.** When lightweight tasks slowed down, the cause
+  was established from context-switch counts rather than assumed, and the design
+  prediction that turned out wrong was kept next to the measurement.
+- **Keeping scope small.** Each component had to justify its existence, and each
+  trade-off is written down.
+
+## License
+
+No license has been specified yet.
+
+## Author
+
+**Adhiraj Dubey**
+GitHub: [https://github.com/Adhiraj170204](https://github.com/Adhiraj170204)
