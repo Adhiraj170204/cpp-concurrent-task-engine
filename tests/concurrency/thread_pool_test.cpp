@@ -16,16 +16,16 @@
 #include "taskengine/core/task_result.hpp"
 #include "taskengine/core/task_state.hpp"
 
+#include "support/threads.hpp"
+
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
-#include <filesystem>
 #include <future>
 #include <memory>
-#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -40,49 +40,8 @@ using taskengine::TaskResult;
 using taskengine::TaskState;
 using taskengine::ThreadPool;
 
-// A one-shot gate, used instead of a sleep whenever a test needs a task to stay
-// inside execute() until the test says otherwise.
-class Gate {
-public:
-    void open() {
-        {
-            const std::lock_guard<std::mutex> lock{mutex_};
-            open_ = true;
-        }
-        condition_.notify_all();
-    }
-
-    void wait() {
-        std::unique_lock<std::mutex> lock{mutex_};
-        condition_.wait(lock, [this] { return open_; });
-    }
-
-private:
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    bool open_{false};
-};
-
-// C++17 has no std::barrier. This one exists only to prove that several workers
-// really do run at the same time.
-class Barrier {
-public:
-    explicit Barrier(int count) : remaining_(count) {}
-
-    void arrive_and_wait() {
-        std::unique_lock<std::mutex> lock{mutex_};
-        if (--remaining_ == 0) {
-            condition_.notify_all();
-            return;
-        }
-        condition_.wait(lock, [this] { return remaining_ == 0; });
-    }
-
-private:
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    int remaining_;
-};
+using taskengine::test::Barrier;
+using taskengine::test::Gate;
 
 class CountingTask final : public Task {
 public:
@@ -137,33 +96,15 @@ std::future<TaskResult> submit(ThreadPool& pool, TaskId id, std::unique_ptr<Task
 // is_shut_down() becomes true at the exact instant the queue is closed and
 // drained, so this waits on a real predicate that is certain to become true.
 // No duration is being guessed at.
+//
+// A condition variable is not available here without adding a test-only hook
+// to the production pool, because the transition being waited for happens
+// inside shutdown_now itself. This is the one yield on a predicate that remains
+// in the suites, and it stays for that reason.
 void wait_until_shut_down(const ThreadPool& pool) {
     while (!pool.is_shut_down()) {
         std::this_thread::yield();
     }
-}
-
-// One entry per thread in this process. Linux-specific, which this project
-// already is.
-std::size_t live_thread_count() {
-    std::size_t count = 0;
-    for (const auto& entry : std::filesystem::directory_iterator{"/proc/self/task"}) {
-        (void)entry;
-        ++count;
-    }
-    return count;
-}
-
-// A baseline taken only after any runtime-owned background threads exist.
-//
-// A sanitizer runtime creates a background thread lazily, on the first
-// pthread_create in the process. Taking the baseline before that happens would
-// count it as one of our workers and make the measurement wrong under TSan
-// while passing in an ordinary build. Creating and destroying a throwaway pool
-// first forces it into existence.
-std::size_t thread_baseline() {
-    { const ThreadPool warmup{1, 1}; }
-    return live_thread_count();
 }
 
 bool is_ready(const std::future<TaskResult>& future) {
@@ -184,17 +125,18 @@ TEST(ThreadPool, RejectsZeroQueueCapacity) {
 }
 
 TEST(ThreadPool, StartsExactlyTheRequestedNumberOfWorkers) {
-    const std::size_t baseline = thread_baseline();
+    const std::set<int> baseline = taskengine::test::thread_baseline();
     {
         const ThreadPool pool{4, 8};
         EXPECT_EQ(pool.worker_count(), 4u);
-        EXPECT_EQ(live_thread_count(), baseline + 4);
+        EXPECT_EQ(taskengine::test::threads_beyond(baseline), 4u);
         EXPECT_FALSE(pool.is_shut_down());
     }
     // I4 and the M4 acceptance criterion: no threads left behind. Had any
     // worker still been joinable, destroying the thread vector would have
     // called std::terminate and this process would already be gone.
-    EXPECT_EQ(live_thread_count(), baseline);
+    EXPECT_TRUE(taskengine::test::wait_until_no_threads_beyond(baseline))
+        << "worker threads outlived their pool";
 }
 
 // --- execution --------------------------------------------------------------
@@ -384,7 +326,7 @@ TEST(ThreadPool, SubmitAfterShutdownIsRefusedAndTheCallerIsToldWhy) {
 
 TEST(ThreadPool, DestructorDrainsAndJoins) {
     constexpr int kTasks = 300;
-    const std::size_t baseline = thread_baseline();
+    const std::set<int> baseline = taskengine::test::thread_baseline();
     std::atomic<int> executions{0};
     std::vector<std::future<TaskResult>> futures;
     futures.reserve(kTasks);
@@ -395,7 +337,8 @@ TEST(ThreadPool, DestructorDrainsAndJoins) {
         }
         // No explicit shutdown: the destructor has to do it.
     }
-    EXPECT_EQ(live_thread_count(), baseline);
+    EXPECT_TRUE(taskengine::test::wait_until_no_threads_beyond(baseline))
+        << "worker threads outlived their pool";
     EXPECT_EQ(executions.load(), kTasks);
     for (auto& future : futures) {
         ASSERT_TRUE(is_ready(future));
@@ -417,6 +360,7 @@ TEST(ThreadPool, EveryFutureIsFulfilledExactlyOnceUnderLoadAndAbortShutdown) {
     std::atomic<int> executions{0};
     std::atomic<int> accepted{0};
     std::vector<std::future<TaskResult>> futures(kTotal);
+    Gate first_accepted;
 
     {
         ThreadPool pool{4, 16};
@@ -430,23 +374,24 @@ TEST(ThreadPool, EveryFutureIsFulfilledExactlyOnceUnderLoadAndAbortShutdown) {
                     TaskEnvelope envelope{static_cast<TaskId>(index), counting(executions)};
                     futures[static_cast<std::size_t>(index)] = envelope.get_future();
                     if (pool.submit(std::move(envelope))) {
-                        accepted.fetch_add(1, std::memory_order_relaxed);
+                        // Exactly one thread sees the counter at zero, so the
+                        // gate opens once without a lock on every submission.
+                        if (accepted.fetch_add(1, std::memory_order_relaxed) == 0) {
+                            first_accepted.open();
+                        }
                     }
                 }
             });
         }
 
-        // Wait until submission is genuinely under way before aborting.
+        // Wait until a submission has actually been accepted before aborting.
         //
-        // Without this, the abort can close the queue before any submitter
-        // thread has reached its first push, so every submission is refused and
-        // the accepted path is never exercised -- which showed up as a flake
-        // under AddressSanitizer, where thread start-up is slower. This is not
-        // a timing guess: the pool is open and the queue has capacity, so the
-        // predicate is certain to become true.
-        while (accepted.load(std::memory_order_relaxed) == 0) {
-            std::this_thread::yield();
-        }
+        // Without this, the abort can close the queue before any submitter has
+        // reached its first push, every submission is refused, and the accepted
+        // path is never exercised -- which showed up as a flake under
+        // AddressSanitizer, where thread start-up is slower. A gate opened by
+        // the first accepted submission makes it certain, with no polling.
+        first_accepted.wait();
 
         pool.shutdown_now();
 

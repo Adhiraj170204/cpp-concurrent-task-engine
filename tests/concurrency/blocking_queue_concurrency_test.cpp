@@ -16,6 +16,8 @@
 
 #include "taskengine/concurrency/blocking_queue.hpp"
 
+#include "support/threads.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -28,6 +30,7 @@
 namespace {
 
 using taskengine::BlockingQueue;
+using taskengine::test::Gate;
 
 // std::atomic is not copyable, so these vectors are sized once and then filled
 // in place. Zeroing explicitly rather than relying on value-initialisation of
@@ -230,20 +233,29 @@ TEST(BlockingQueueConcurrency, ClosingMidStreamDeliversExactlyWhatWasAccepted) {
     // push returned true is always delivered, and an item whose push returned
     // false never appears. Nothing is lost and nothing is invented.
     //
-    // Producers here run until the queue turns them away rather than for a
-    // fixed count, so the close below necessarily lands in the middle of live
-    // traffic. Asserting "not everything was accepted" on fixed-count producers
-    // would be a race: they might legitimately finish first on a fast machine,
-    // and the test would fail for no reason.
+    // Deterministic by construction. The consumer threads wait for the close,
+    // so before it the main thread is the only consumer, and that bounds
+    // exactly how far the producers can get: at most kDrainedByMainBeforeClosing
+    // items popped by main plus kCapacity items still queued are accepted, and
+    // each producer takes at most one further ticket, for the push the close
+    // refuses. The close still lands on live producers, most of them blocked in
+    // push against a full queue, and the consumers then drain what remains.
+    //
+    // An earlier version let consumers run from the start. How much traffic
+    // passed before the close then depended on scheduling, so any bound on the
+    // producers was a race. Fixed at M7.
     constexpr int kProducers = 4;
     constexpr int kConsumers = 3;
-    constexpr int kTicketSpace = 200000;  // an upper bound, not a target
+    constexpr std::size_t kCapacity = 8;
+    constexpr int kTicketSpace = 200000;
     constexpr int kDrainedByMainBeforeClosing = 500;
+    constexpr int kMaxAccepted = kDrainedByMainBeforeClosing + static_cast<int>(kCapacity);
 
-    BlockingQueue<int> queue{8};
+    BlockingQueue<int> queue{kCapacity};
     std::vector<std::atomic<int>> accepted = zeroed_counters(kTicketSpace);
     std::vector<std::atomic<int>> seen = zeroed_counters(kTicketSpace);
     std::atomic<int> next_ticket{0};
+    Gate closed;
 
     std::vector<std::thread> producers;
     producers.reserve(kProducers);
@@ -252,7 +264,7 @@ TEST(BlockingQueueConcurrency, ClosingMidStreamDeliversExactlyWhatWasAccepted) {
             for (;;) {
                 const int value = next_ticket.fetch_add(1, std::memory_order_relaxed);
                 if (value >= kTicketSpace) {
-                    return;  // bound on the counter arrays, not the real exit
+                    return;  // array bound; unreachable given the arithmetic above
                 }
                 int payload = value;
                 if (!queue.push(std::move(payload))) {
@@ -267,15 +279,13 @@ TEST(BlockingQueueConcurrency, ClosingMidStreamDeliversExactlyWhatWasAccepted) {
     consumers.reserve(kConsumers);
     for (int c = 0; c < kConsumers; ++c) {
         consumers.emplace_back([&] {
+            closed.wait();
             while (const std::optional<int> item = queue.pop()) {
                 seen[static_cast<std::size_t>(*item)].fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
 
-    // Drain some traffic here first, so the close below lands in the middle of
-    // real work rather than before the producers have started. Deterministic
-    // progress, no sleeping.
     for (int i = 0; i < kDrainedByMainBeforeClosing; ++i) {
         const std::optional<int> item = queue.pop();
         ASSERT_TRUE(item.has_value());
@@ -283,6 +293,7 @@ TEST(BlockingQueueConcurrency, ClosingMidStreamDeliversExactlyWhatWasAccepted) {
     }
 
     queue.close();
+    closed.open();
 
     for (auto& producer : producers) {
         producer.join();
@@ -304,13 +315,10 @@ TEST(BlockingQueueConcurrency, ClosingMidStreamDeliversExactlyWhatWasAccepted) {
     }
 
     EXPECT_EQ(mismatches, 0);
-    // Main popped this many before closing, so at least this many were
-    // accepted. Guaranteed, unlike any upper bound would be.
     EXPECT_GE(accepted_count, kDrainedByMainBeforeClosing);
+    EXPECT_LE(accepted_count, kMaxAccepted);
+    EXPECT_LE(next_ticket.load(), kMaxAccepted + kProducers);
     EXPECT_TRUE(queue.is_closed());
-    EXPECT_LT(next_ticket.load(), kTicketSpace)
-        << "producers exhausted the ticket space instead of being stopped by "
-           "close(); the mid-stream property was not actually exercised";
 }
 
 }  // namespace

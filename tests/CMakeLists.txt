@@ -70,7 +70,55 @@ target_link_libraries(taskengine_concurrency_tests PRIVATE
     taskengine
     GTest::gtest_main)
 
+# Shared test-support headers live under tests/support.
+target_include_directories(taskengine_concurrency_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 target_compile_options(taskengine_concurrency_tests PRIVATE ${TASKENGINE_WARNINGS})
 
 gtest_discover_tests(taskengine_concurrency_tests
     PROPERTIES LABELS concurrency)
+
+# ---------------------------------------------------------------------------
+# Stress tests -- CTest label "stress" (ARCHITECTURE.md 10.4)
+# High volume and shutdown under live load. Larger than the concurrency suite,
+# so kept separate to leave the fast suites usable during development, and meant
+# above all to be run under ThreadSanitizer.
+# ---------------------------------------------------------------------------
+add_executable(taskengine_stress_tests
+    stress/engine_stress_test.cpp)
+
+target_link_libraries(taskengine_stress_tests PRIVATE
+    taskengine
+    GTest::gtest_main)
+
+# Shared test-support headers live under tests/support.
+target_include_directories(taskengine_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+target_compile_options(taskengine_stress_tests PRIVATE ${TASKENGINE_WARNINGS})
+
+gtest_discover_tests(taskengine_stress_tests
+    PROPERTIES LABELS stress)
+
+# ---------------------------------------------------------------------------
+# Integration tests -- CTest label "integration" (PLAN.md M7)
+# Run the real task-engine executable in a child process: exit codes, stdout
+# versus stderr, and graceful handling of SIGINT and SIGTERM. The path of the
+# built binary is compiled in, and the dependency makes sure it exists first.
+# ---------------------------------------------------------------------------
+add_executable(taskengine_integration_tests
+    integration/cli_integration_test.cpp)
+
+target_link_libraries(taskengine_integration_tests PRIVATE
+    GTest::gtest_main)
+
+target_compile_features(taskengine_integration_tests PRIVATE cxx_std_17)
+
+target_compile_options(taskengine_integration_tests PRIVATE ${TASKENGINE_WARNINGS})
+
+target_compile_definitions(taskengine_integration_tests PRIVATE
+    TASKENGINE_CLI_PATH="$<TARGET_FILE:task-engine>")
+
+add_dependencies(taskengine_integration_tests task-engine)
+
+gtest_discover_tests(taskengine_integration_tests
+    PROPERTIES LABELS integration)
