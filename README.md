@@ -66,6 +66,8 @@ directly:
 ```bash
 ctest --test-dir build/debug -L unit          # fast, no threads
 ctest --test-dir build/debug -L concurrency  # threaded behaviour
+ctest --test-dir build/debug -L stress       # high volume, shutdown under load
+ctest --test-dir build/debug -L integration  # the real binary: exit codes, signals
 ```
 
 GoogleTest is fetched from GitHub at *configure* time, so the first configure
@@ -187,6 +189,9 @@ include/taskengine/tasks/   concrete workloads (ComputeTask, SleepTask)
 src/app/main.cpp            composition root
 tests/unit/                 unit suite (CTest label: unit)
 tests/concurrency/          threaded suite (CTest label: concurrency)
+tests/stress/               volume and shutdown under load (CTest label: stress)
+tests/integration/          the CLI in a child process (CTest label: integration)
+tests/support/              shared test helpers: gates, barrier, thread observation
 docs/                       architecture and decision records
 build/                      build trees (gitignored)
 ```

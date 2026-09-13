@@ -1160,3 +1160,138 @@ which are real measurements of that invocation, and it says so in the output:
 single run, no warm-up, not a benchmark. Repeatable measurement — warm-up,
 repeats, medians, environment capture — is M8 with its own binary. The CLI must
 not become the thing whose numbers get quoted.
+
+---
+
+## D33 — Interrupted runs stop gracefully, and the test suites are deterministic by construction
+
+**Status:** Accepted · **Milestone:** M7
+
+### Graceful handling of SIGINT and SIGTERM
+
+**Decision.** The CLI installs handlers for SIGINT and SIGTERM with `sigaction`.
+A handler does nothing but set a `std::atomic<bool>`. The submission loop
+checks it between submissions; on interruption the CLI stops submitting, calls
+`shutdown_now()`, prints the outcome with an explicit "interrupted" line, and
+exits with code 1.
+
+**Reason.** PLAN.md M7 lists "interrupted run", "signal handling" and "graceful
+termination". Before this, Ctrl-C simply killed the process: no report, no
+distinction between an operator stopping a run and a crash. Abort shutdown is
+the right response because the operator asked to stop, not to finish the batch;
+work already running still completes and reports its real outcome, and
+abandoned work is counted as rejected rather than vanishing. Exit code 1 because
+the run did not do what was asked, even if every task that did run succeeded.
+
+`std::atomic<bool>` rather than `volatile sig_atomic_t`, and this was a defect
+found in self-review rather than a style choice. `sig_atomic_t` only has defined
+behaviour between a handler and the thread it interrupted. In a multithreaded
+process the kernel may deliver the signal to any thread that does not block it,
+including a worker, and the handler's write would then race the submitting
+thread's read. C++17 [support.signal] permits plain lock-free atomic operations
+in a signal handler, and an atomic is safe across threads, so one type satisfies
+both rules. A `static_assert` on `is_always_lock_free` makes the precondition a
+build failure instead of an assumption. `sigaction` rather than `std::signal`
+because the handler is guaranteed to stay installed and the mask is explicit.
+
+**Alternative considered.** Blocking the signals in every worker thread so the
+handler always runs on the submitting thread. Correct, but it requires changing
+the mask around thread creation inside the pool, which is library code that
+should know nothing about process signals. The atomic alone is sufficient.
+
+A self-pipe or `signalfd` read by a dedicated thread. Far more machinery than a
+flag checked in a loop that is already running.
+
+**Trade-off.** Interruption is noticed between submissions, not instantly. A
+submitter blocked in `push` against a full queue notices only after a worker
+frees a slot, so latency is bounded by one task. A task already running is
+never interrupted, consistent with D6.
+
+### An integration test group
+
+**Decision.** A fourth CTest label, `integration`, in its own binary, alongside
+`unit`, `concurrency` and `stress` (ARCHITECTURE.md §10.1 is extended to match).
+It runs the real executable in a child process.
+
+**Reason.** The unit tests already cover `parse_args` and `exit_code_for` as
+functions. What only a process can show is that `main()` wires them correctly,
+that diagnostics reach stderr while results reach stdout, and that a signal
+produces an orderly, truthful stop. The signal tests are deterministic: the CLI
+installs its handlers, then prints and flushes a `running...` line, so the
+parent reading that line is proof the handlers are in place before it sends the
+signal. To make that possible the configuration block is now printed before the
+run rather than after, which is also simply better output for a long run.
+
+### Determinism fixes in the suites
+
+Four problems, all in test code, all found while auditing for the M7 rule that
+tests must not coordinate with sleeps, yields or timing.
+
+1. **Two yield-polls replaced by gates.** Both waited for "a submission has been
+   accepted" by spinning on a counter. A condition variable is a correct
+   alternative there — the submitter that is accepted first opens a gate — so
+   the spin went. Shared `Gate` and `Barrier` helpers now live in
+   `tests/support/threads.hpp` instead of being defined privately in one file.
+2. **One yield-poll kept, with the reason written down.** The abort-shutdown
+   test must release a running task only after `shutdown_now` has drained the
+   queue. That transition happens inside the production pool, so no condition
+   variable can observe it without adding a test-only hook to library code.
+3. **A latent hang in a new stress test.** It classified a submission as accepted
+   when the returned future was not yet ready. A fast worker can finish an
+   accepted task before that check, so every submission could be misread as
+   refused and the wait for an acceptance would never end. Replaced with gates
+   that make both the accepted and the refused paths certain.
+4. **A race with the kernel in every thread-count assertion.** `pthread_join`
+   returns when the kernel clears the thread id and wakes the joiner, which
+   happens in `mm_release` during exit — before `release_task` removes the
+   thread's `/proc/self/task` entry. A correctly joined thread can therefore
+   still be listed for a moment. The checks now compare sets of thread ids
+   rather than counts, and wait for threads outside the baseline to disappear
+   with a generous bound. That is the one bounded poll in the suites, and there
+   is no correct alternative: the kernel publishes no event for the final step.
+   The bound exists only so a genuinely leaked thread fails instead of hanging.
+
+A queue test that bounded how far producers got before a close was also
+restructured. Its consumers ran from the start, so the amount of traffic before
+the close — and therefore the bound — depended on scheduling. Consumers now wait
+for the close, which makes the bound exact rather than likely.
+
+**Trade-off.** The tests are a little longer, and the gates make the intended
+interleaving explicit rather than hoped for. None of these changes weakened an
+assertion; two of them made assertions exact that were previously only
+probable.
+
+### Observed runtime behaviour, and a correction to D32
+
+Observed on Linux by reading `/proc/<pid>/status` once a second during an
+open-ended run with eight workers, then delivering a signal:
+
+- The thread count held at exactly nine — the submitting thread plus eight
+  workers — for the whole run. No thread is created per task.
+- SIGTERM and SIGINT each produced an orderly stop: the report was printed with
+  the interruption stated, the exit code was 1, and no process was left behind.
+- Resident memory was **not** flat. It rose from 3.6 MB to 19.1 MB over five
+  seconds while roughly 460 thousand tasks completed.
+
+That growth is the per-worker `Sample` buffers, 40 bytes per completed task,
+doing exactly what D10 said they would: nearest-rank percentiles are exact only
+because every sample is kept. It is not the futures, which the CLI discards.
+
+D32, and a comment in `main.cpp`, implied that discarding futures kept memory
+flat regardless of `--tasks`. That was wrong. Discarding futures avoids holding a
+second per-task allocation, the promise shared state, on top of the sample; it
+does not make memory constant. The comment is corrected; D32 is left as written,
+per the log's rule, and this is the correction.
+
+The practical consequence is a ceiling on run size: at 40 bytes per task, this
+machine's 8 GB allows on the order of 10^8 tasks in one run. That is recorded as
+a known limitation rather than engineered around. Bounded-memory percentiles
+would mean approximate histograms — a different design with a different
+trade-off, and not something a testing milestone should introduce.
+
+The same observation also explains why an interrupted run usually reports zero
+rejected tasks. With a single submitting thread the workers outpace submission,
+so the queue is close to empty whenever the signal lands and the abort finds
+little or nothing to discard. That is a property of the workload, not a missed
+rejection, and it matters for benchmarking: a single submitter can bound
+throughput before the workers do (ARCHITECTURE.md §8.5, item 2).

@@ -575,8 +575,10 @@ suppression without a reason is a hidden bug.
 
 ### 10.1 Structure
 
-CTest labels — `unit`, `concurrency`, `stress` — so the narrowest useful suite
-runs first.
+CTest labels — `unit`, `concurrency`, `stress`, `integration` — one test binary
+each, so the narrowest useful suite runs first. `integration` was added at M7
+(D33): it runs the real executable in a child process to check exit codes,
+stdout versus stderr, and graceful handling of SIGINT and SIGTERM.
 
 ### 10.2 Unit (`unit`, no threads)
 
@@ -609,6 +611,13 @@ lost wakeup — run under TSan.
 **No sleep-based synchronization in tests.** Ordering is established with
 condition variables or counters. A test that passes because a sleep was long
 enough is a test that will fail in CI.
+
+Two bounded waits on a predicate remain, each because no correct alternative
+exists (D33). One waits for an abort to drain the queue, a transition that
+happens inside the production pool and cannot be observed without a test hook
+in library code. The other waits for exited threads to leave `/proc/self/task`,
+because `pthread_join` returns before the kernel removes that entry and the
+kernel publishes no event for the final step.
 
 **What these tests actually prove.** A concurrency test passing once proves very
 little — it proves that one interleaving worked. Repetition raises confidence
@@ -669,7 +678,7 @@ task-engine/
 |-- docs/            ARCHITECTURE.md   DECISIONS.md
 |-- include/taskengine/{core,concurrency,execution,metrics}/
 |-- src/{core,concurrency,execution,metrics,cli,app}/
-|-- tests/           unit/  concurrency/  stress/
+|-- tests/           unit/  concurrency/  stress/  integration/  support/
 |-- benchmarks/
 ```
 
