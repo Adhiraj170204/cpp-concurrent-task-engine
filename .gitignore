@@ -1,60 +1,62 @@
-# Build trees. D11 defines four: debug, asan, tsan, release.
-# Kept outside source directories; never committed.
-build/
-build-*/
-cmake-build-*/
+# =========================
+# Local development / AI instructions
+# =========================
+PLAN.md
+CLAUDE.md
 
-# CMake-generated files, in case a tree is ever configured in-source by mistake.
-CMakeCache.txt
+# =========================
+# Build artifacts
+# =========================
+/build/
+/cmake-build-*/
 CMakeFiles/
-cmake_install.cmake
-install_manifest.txt
+CMakeCache.txt
 CTestTestfile.cmake
-Testing/
-CMakeUserPresets.json
-_deps/
-
-# Compile database: generated, machine-specific, but useful to editors.
+Makefile
+install_manifest.txt
 compile_commands.json
 
-# Object files, libraries, executables.
+# =========================
+# C / C++ generated files
+# =========================
 *.o
+*.obj
 *.a
 *.so
 *.so.*
+*.dll
+*.exe
 *.out
 
-# Precompiled headers and generated dependency files.
-*.gch
-*.pch
-*.d
-
-# Crash and debug artifacts. Expected while testing shutdown paths and UB.
-#
-# Anchored with a leading slash. An unanchored "core" matches any file OR
-# DIRECTORY named core at any depth, which silently excluded src/core/ and
-# include/taskengine/core/ from the repository: git add -A skipped them and
-# git status still reported a clean tree. Core dumps land in the working
-# directory of the crashing process, which is either the repository root or a
-# build tree that is already ignored.
+# =========================
+# Debugging / crash artifacts
+# =========================
 /core
 /core.[0-9]*
-vgcore.*
+*.dmp
+perf.data
+perf.data.old
 
-# Sanitizer, coverage, and profiler output (D11).
-*.profraw
-*.profdata
+# =========================
+# Coverage / sanitizer artifacts
+# =========================
 *.gcda
 *.gcno
 *.gcov
-perf.data
-perf.data.old
-callgrind.out.*
+coverage/
+.profraw
+.profdata
 
-# Editor and tooling state.
+# =========================
+# IDE / editor files
+# =========================
 .vscode/
 .idea/
-.cache/
-.clangd/
 *.swp
-*~
+*.swo
+
+# =========================
+# OS-generated files
+# =========================
+.DS_Store
+Thumbs.db
